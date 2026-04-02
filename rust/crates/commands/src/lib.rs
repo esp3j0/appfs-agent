@@ -116,8 +116,8 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "config",
         aliases: &[],
-        summary: "Inspect Claude config files or merged sections",
-        argument_hint: Some("[env|hooks|model|plugins]"),
+        summary: "Inspect Claw config files or merged sections",
+        argument_hint: Some("[env|hooks|model|provider|plugins]"),
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -3670,7 +3670,7 @@ mod tests {
         assert!(help.contains("/clear [--confirm]"));
         assert!(help.contains("/cost"));
         assert!(help.contains("/resume <session-path>"));
-        assert!(help.contains("/config [env|hooks|model|plugins]"));
+        assert!(help.contains("/config [env|hooks|model|provider|plugins]"));
         assert!(help.contains("/mcp [list|show <server>|help]"));
         assert!(help.contains("/memory"));
         assert!(help.contains("/init"));
