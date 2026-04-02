@@ -1441,14 +1441,12 @@ mod tests {
         std::env::temp_dir().join(format!("runtime-conversation-{label}-{nanos}.json"))
     }
 
-    #[cfg(windows)]
-    fn shell_snippet(script: &str) -> String {
-        script.replace('\'', "\"")
+    fn shell_echo(message: &str) -> String {
+        format!("printf '{message}'")
     }
 
-    #[cfg(not(windows))]
-    fn shell_snippet(script: &str) -> String {
-        script.to_string()
+    fn shell_echo_and_exit(message: &str, code: i32) -> String {
+        format!("printf '{message}'; exit {code}")
     }
 
     #[test]

@@ -34,6 +34,7 @@ pub mod team_cron_registry;
 pub mod trust_resolver;
 mod usage;
 pub mod worker_boot;
+mod windows_shell;
 
 pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
@@ -143,6 +144,10 @@ pub use worker_boot::{
     Worker, WorkerEvent, WorkerEventKind, WorkerFailure, WorkerFailureKind, WorkerReadySnapshot,
     WorkerRegistry, WorkerStatus,
 };
+pub use windows_shell::{bash_shell_path, set_shell_if_windows};
+
+#[cfg(windows)]
+pub use windows_shell::windows_path_to_posix_path;
 
 #[cfg(test)]
 pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {

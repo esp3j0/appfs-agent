@@ -48,6 +48,7 @@ use runtime::{
     OAuthTokenExchangeRequest, PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent,
     ResolvedPermissionMode, RuntimeConfig, RuntimeError, RuntimeProviderConfig,
     RuntimeProviderKind, Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
+    set_shell_if_windows,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -107,6 +108,7 @@ Run `claw --help` for usage."
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
+    set_shell_if_windows()?;
     match parse_args(&args)? {
         CliAction::DumpManifests => dump_manifests(),
         CliAction::BootstrapPlan => print_bootstrap_plan(),
@@ -589,7 +591,18 @@ fn resolve_model_alias(model: &str) -> &str {
 }
 
 fn normalize_allowed_tools(values: &[String]) -> Result<Option<AllowedToolSet>, String> {
-    current_tool_registry()?.normalize_allowed_tools(values)
+    if values.is_empty() {
+        return Ok(None);
+    }
+
+    match current_tool_registry() {
+        Ok(registry) => registry.normalize_allowed_tools(values),
+        Err(_) => GlobalToolRegistry::builtin().normalize_allowed_tools(values),
+    }
+}
+
+fn cli_parse_cwd() -> PathBuf {
+    env::current_dir().unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."))
 }
 
 fn configured_default_model() -> Option<String> {
@@ -599,7 +612,7 @@ fn configured_default_model() -> Option<String> {
 }
 
 fn current_tool_registry() -> Result<GlobalToolRegistry, String> {
-    let cwd = env::current_dir().map_err(|error| error.to_string())?;
+    let cwd = cli_parse_cwd();
     let loader = ConfigLoader::default_for(&cwd);
     let runtime_config = loader.load().map_err(|error| error.to_string())?;
     let state = build_runtime_plugin_state_with_loader(&cwd, &loader, &runtime_config)
@@ -670,7 +683,7 @@ fn filter_tool_specs(
 }
 
 fn parse_system_prompt_args(args: &[String]) -> Result<CliAction, String> {
-    let mut cwd = env::current_dir().map_err(|error| error.to_string())?;
+    let mut cwd = cli_parse_cwd();
     let mut date = DEFAULT_DATE.to_string();
     let mut index = 0;
 
