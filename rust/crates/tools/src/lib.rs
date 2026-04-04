@@ -17,6 +17,7 @@ use runtime::{
     mcp_tool_bridge::McpToolRegistry,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
     read_file,
+    summary_compression::compress_summary_text,
     task_registry::TaskRegistry,
     team_cron_registry::{CronRegistry, TeamRegistry},
     worker_boot::{WorkerReadySnapshot, WorkerRegistry},
@@ -2145,6 +2146,14 @@ enum LaneEventName {
     Finished,
     #[serde(rename = "lane.failed")]
     Failed,
+    #[serde(rename = "lane.reconciled")]
+    Reconciled,
+    #[serde(rename = "lane.merged")]
+    Merged,
+    #[serde(rename = "lane.superseded")]
+    Superseded,
+    #[serde(rename = "lane.closed")]
+    Closed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -3162,12 +3171,15 @@ fn persist_agent_terminal_state(
         });
     } else {
         next_manifest.current_blocker = None;
+        let compressed_detail = result
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| compress_summary_text(value.trim()));
         next_manifest.lane_events.push(LaneEvent {
             event: LaneEventName::Finished,
             status: status.to_string(),
             emitted_at: iso8601_now(),
             failure_class: None,
-            detail: None,
+            detail: compressed_detail,
         });
     }
     write_agent_manifest(&next_manifest)
