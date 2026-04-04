@@ -186,7 +186,7 @@ impl HookRunner {
         let mut child = match shell_command(command) {
             Ok(child) => child,
             Err(error) => {
-                return HookCommandOutcome::Warn {
+                return HookCommandOutcome::Failed {
                     message: format!(
                         "{} hook `{command}` failed to start for `{tool_name}`: {error}",
                         event.as_str()

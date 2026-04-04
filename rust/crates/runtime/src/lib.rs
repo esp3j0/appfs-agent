@@ -33,8 +33,8 @@ pub mod task_registry;
 pub mod team_cron_registry;
 pub mod trust_resolver;
 mod usage;
-pub mod worker_boot;
 mod windows_shell;
+pub mod worker_boot;
 
 pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
@@ -47,9 +47,8 @@ pub use config::{
     McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig,
     McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, OAuthConfig,
     ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig, RuntimeHookConfig,
-    RuntimePermissionRuleConfig, RuntimePluginConfig, RuntimeProviderConfig,
-    RuntimeProviderKind, ScopedMcpServerConfig,
-    CLAW_SETTINGS_SCHEMA_NAME,
+    RuntimePermissionRuleConfig, RuntimePluginConfig, RuntimeProviderConfig, RuntimeProviderKind,
+    ScopedMcpServerConfig, CLAW_SETTINGS_SCHEMA_NAME,
 };
 pub use conversation::{
     auto_compaction_threshold_from_env, ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent,
@@ -140,11 +139,11 @@ pub use trust_resolver::{TrustConfig, TrustDecision, TrustEvent, TrustPolicy, Tr
 pub use usage::{
     format_usd, pricing_for_model, ModelPricing, TokenUsage, UsageCostEstimate, UsageTracker,
 };
+pub use windows_shell::{bash_shell_path, set_shell_if_windows};
 pub use worker_boot::{
     Worker, WorkerEvent, WorkerEventKind, WorkerFailure, WorkerFailureKind, WorkerReadySnapshot,
     WorkerRegistry, WorkerStatus,
 };
-pub use windows_shell::{bash_shell_path, set_shell_if_windows};
 
 #[cfg(windows)]
 pub use windows_shell::windows_path_to_posix_path;

@@ -175,12 +175,12 @@ where
         );
     };
 
-    let auth = if provider_override.api_key_env.is_none() && provider_override.auth_token_env.is_none()
-    {
-        resolve_default_auth()?
-    } else {
-        resolve_anthropic_auth_from_override(provider_override)?
-    };
+    let auth =
+        if provider_override.api_key_env.is_none() && provider_override.auth_token_env.is_none() {
+            resolve_default_auth()?
+        } else {
+            resolve_anthropic_auth_from_override(provider_override)?
+        };
     let base_url = provider_override
         .base_url
         .clone()

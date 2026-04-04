@@ -306,10 +306,13 @@ impl McpToolRegistry {
 mod tests {
     use std::collections::BTreeMap;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
+    use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     use super::*;
     use crate::config::{
@@ -422,8 +425,11 @@ mod tests {
         ]
         .join("\n");
         fs::write(&script_path, script).expect("write script");
+        #[cfg(unix)]
         let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
+        #[cfg(unix)]
         permissions.set_mode(0o755);
+        #[cfg(unix)]
         fs::set_permissions(&script_path, permissions).expect("chmod");
         script_path
     }
@@ -433,11 +439,14 @@ mod tests {
         server_name: &str,
         log_path: &Path,
     ) -> ScopedMcpServerConfig {
+        let python = python_invocation();
+        let mut args = python.args;
+        args.push(script_path.to_string_lossy().into_owned());
         ScopedMcpServerConfig {
             scope: ConfigSource::Local,
             config: McpServerConfig::Stdio(McpStdioServerConfig {
-                command: "python3".to_string(),
-                args: vec![script_path.to_string_lossy().into_owned()],
+                command: python.command,
+                args,
                 env: BTreeMap::from([
                     ("MCP_SERVER_LABEL".to_string(), server_name.to_string()),
                     (
@@ -448,6 +457,54 @@ mod tests {
                 tool_call_timeout_ms: Some(1_000),
             }),
         }
+    }
+
+    #[derive(Debug, Clone)]
+    struct PythonInvocation {
+        command: String,
+        args: Vec<String>,
+    }
+
+    fn python_invocation() -> PythonInvocation {
+        for key in ["MCP_TEST_PYTHON", "PYTHON3", "PYTHON"] {
+            if let Ok(value) = std::env::var(key) {
+                if !value.trim().is_empty() {
+                    return PythonInvocation {
+                        command: value,
+                        args: Vec::new(),
+                    };
+                }
+            }
+        }
+
+        #[cfg(windows)]
+        if command_runs_successfully("py", &["-3", "--version"]) {
+            return PythonInvocation {
+                command: String::from("py"),
+                args: vec![String::from("-3")],
+            };
+        }
+
+        for candidate in ["python3", "python"] {
+            if command_runs_successfully(candidate, &["--version"]) {
+                return PythonInvocation {
+                    command: candidate.to_string(),
+                    args: Vec::new(),
+                };
+            }
+        }
+
+        panic!("expected a Python interpreter for MCP tool bridge tests")
+    }
+
+    fn command_runs_successfully(command: &str, args: &[&str]) -> bool {
+        Command::new(command)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
     }
 
     #[test]

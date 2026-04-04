@@ -25,9 +25,9 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use api::{
     resolve_startup_auth_source, AnthropicClient, AuthSource, ContentBlockDelta, InputContentBlock,
-    InputMessage, MessageRequest, MessageResponse, OutputContentBlock, PromptCache,
-    ProviderClient, ProviderKind, ProviderOverride,
-    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    InputMessage, MessageRequest, MessageResponse, OutputContentBlock, PromptCache, ProviderClient,
+    ProviderKind, ProviderOverride, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
+    ToolResultContentBlock,
 };
 
 use commands::{
@@ -42,13 +42,13 @@ use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
     clear_oauth_credentials, format_usd, generate_pkce_pair, generate_state, load_system_prompt,
     parse_oauth_callback_request_target, pricing_for_model, resolve_sandbox_status,
-    save_oauth_credentials, ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader,
-    ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime, McpServerManager,
-    McpTool, MessageRole, ModelPricing, OAuthAuthorizationRequest, OAuthConfig,
-    OAuthTokenExchangeRequest, PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent,
-    ResolvedPermissionMode, RuntimeConfig, RuntimeError, RuntimeProviderConfig,
-    RuntimeProviderKind, Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
-    set_shell_if_windows,
+    save_oauth_credentials, set_shell_if_windows, ApiClient, ApiRequest, AssistantEvent,
+    CompactionConfig, ConfigLoader, ConfigSource, ContentBlock, ConversationMessage,
+    ConversationRuntime, McpServerManager, McpTool, MessageRole, ModelPricing,
+    OAuthAuthorizationRequest, OAuthConfig, OAuthTokenExchangeRequest, PermissionMode,
+    PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeConfig,
+    RuntimeError, RuntimeProviderConfig, RuntimeProviderKind, Session, TokenUsage, ToolError,
+    ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -4477,15 +4477,13 @@ impl AnthropicRuntimeClient {
 }
 
 fn resolve_cli_auth_source(oauth: &Option<OAuthConfig>) -> Result<AuthSource, api::ApiError> {
-    resolve_startup_auth_source(|| {
-        Ok(oauth.clone())
-    })
+    resolve_startup_auth_source(|| Ok(oauth.clone()))
 }
 
 fn load_runtime_config_for_cwd(cwd: &Path) -> Result<RuntimeConfig, api::ApiError> {
-    ConfigLoader::default_for(cwd).load().map_err(|error| {
-        api::ApiError::Auth(format!("failed to load runtime config: {error}"))
-    })
+    ConfigLoader::default_for(cwd)
+        .load()
+        .map_err(|error| api::ApiError::Auth(format!("failed to load runtime config: {error}")))
 }
 
 fn provider_override_from_runtime_config(config: &RuntimeProviderConfig) -> ProviderOverride {
@@ -5644,7 +5642,7 @@ mod tests {
     use serde_json::json;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::process::Command;
+    use std::process::{Command, Stdio};
     use std::sync::{Mutex, MutexGuard, OnceLock};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tools::GlobalToolRegistry;
@@ -5681,6 +5679,26 @@ mod tests {
         std::env::temp_dir().join(format!("rusty-claude-cli-{nanos}"))
     }
 
+    fn remove_dir_all_with_retry(path: &Path) {
+        const ATTEMPTS: usize = 6;
+        for attempt in 0..ATTEMPTS {
+            match fs::remove_dir_all(path) {
+                Ok(()) => return,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                Err(error)
+                    if attempt + 1 < ATTEMPTS
+                        && matches!(
+                            error.kind(),
+                            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Other
+                        ) =>
+                {
+                    std::thread::sleep(Duration::from_millis(25 * (attempt as u64 + 1)));
+                }
+                Err(_) => return,
+            }
+        }
+    }
+
     fn git(args: &[&str], cwd: &Path) {
         let status = Command::new("git")
             .args(args)
@@ -5699,6 +5717,43 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn python_command_and_args() -> (String, Vec<String>) {
+        for key in ["MCP_TEST_PYTHON", "PYTHON3", "PYTHON"] {
+            if let Ok(value) = std::env::var(key) {
+                if !value.trim().is_empty() {
+                    return (value, Vec::new());
+                }
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            let status = Command::new("py")
+                .args(["-3", "--version"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            if status.is_ok_and(|status| status.success()) {
+                return (String::from("py"), vec![String::from("-3")]);
+            }
+        }
+
+        for candidate in ["python3", "python"] {
+            let status = Command::new(candidate)
+                .arg("--version")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            if status.is_ok_and(|status| status.success()) {
+                return (candidate.to_string(), Vec::new());
+            }
+        }
+
+        panic!("expected a Python interpreter for CLI MCP tests")
     }
 
     fn with_current_dir<T>(cwd: &Path, f: impl FnOnce() -> T) -> T {
@@ -6845,7 +6900,9 @@ UU conflicted.rs",
 
     #[test]
     fn managed_sessions_default_to_jsonl_and_resolve_legacy_json() {
-        let _guard = cwd_lock().lock().expect("cwd lock");
+        let _guard = cwd_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let workspace = temp_workspace("session-resolution");
         std::fs::create_dir_all(&workspace).expect("workspace should create");
         let previous = std::env::current_dir().expect("cwd");
@@ -6878,12 +6935,14 @@ UU conflicted.rs",
         );
 
         std::env::set_current_dir(previous).expect("restore cwd");
-        std::fs::remove_dir_all(workspace).expect("workspace should clean up");
+        remove_dir_all_with_retry(&workspace);
     }
 
     #[test]
     fn latest_session_alias_resolves_most_recent_managed_session() {
-        let _guard = cwd_lock().lock().expect("cwd lock");
+        let _guard = cwd_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let workspace = temp_workspace("latest-session-alias");
         std::fs::create_dir_all(&workspace).expect("workspace should create");
         let previous = std::env::current_dir().expect("cwd");
@@ -6911,7 +6970,7 @@ UU conflicted.rs",
         );
 
         std::env::set_current_dir(previous).expect("restore cwd");
-        std::fs::remove_dir_all(workspace).expect("workspace should clean up");
+        remove_dir_all_with_retry(&workspace);
     }
 
     #[test]
@@ -7348,23 +7407,26 @@ UU conflicted.rs",
         fs::create_dir_all(&workspace).expect("workspace");
         let script_path = workspace.join("fixture-mcp.py");
         write_mcp_server_fixture(&script_path);
+        let (python_command, python_args) = python_command_and_args();
+        let mut alpha_args = python_args.clone();
+        alpha_args.push(script_path.to_string_lossy().into_owned());
+        let mut broken_args = python_args;
+        broken_args.extend(["-c".to_string(), "import sys; sys.exit(0)".to_string()]);
         fs::write(
             config_home.join("settings.json"),
-            format!(
-                r#"{{
-                  "mcpServers": {{
-                    "alpha": {{
-                      "command": "python3",
-                      "args": ["{}"]
-                    }},
-                    "broken": {{
-                      "command": "python3",
-                      "args": ["-c", "import sys; sys.exit(0)"]
-                    }}
-                  }}
-                }}"#,
-                script_path.to_string_lossy()
-            ),
+            serde_json::to_string_pretty(&json!({
+                "mcpServers": {
+                    "alpha": {
+                        "command": python_command,
+                        "args": alpha_args,
+                    },
+                    "broken": {
+                        "command": python_command_and_args().0,
+                        "args": broken_args,
+                    }
+                }
+            }))
+            .expect("mcp settings should serialize"),
         )
         .expect("write mcp settings");
 

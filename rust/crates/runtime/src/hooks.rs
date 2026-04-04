@@ -422,7 +422,21 @@ impl HookRunner {
         payload: &str,
         abort_signal: Option<&HookAbortSignal>,
     ) -> HookCommandOutcome {
-        let mut child = shell_command(command);
+        let mut child = match shell_command(command) {
+            Ok(child) => child,
+            Err(error) => {
+                return HookCommandOutcome::Failed {
+                    parsed: ParsedHookOutput {
+                        messages: vec![format!(
+                            "{} hook `{command}` failed to start for `{}`: {error}",
+                            event.as_str(),
+                            tool_name
+                        )],
+                        ..ParsedHookOutput::default()
+                    },
+                };
+            }
+        };
         child.stdin(Stdio::piped());
         child.stdout(Stdio::piped());
         child.stderr(Stdio::piped());
@@ -966,6 +980,10 @@ mod tests {
 
     fn shell_echo(message: &str) -> String {
         format!("printf '{message}'")
+    }
+
+    fn shell_snippet(command: &str) -> String {
+        command.to_string()
     }
 
     fn shell_echo_and_exit(message: &str, code: i32) -> String {

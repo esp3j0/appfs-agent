@@ -1265,6 +1265,7 @@ mod tests {
     use std::fs;
     use std::io::ErrorKind;
     use std::path::{Path, PathBuf};
+    use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1640,9 +1641,10 @@ mod tests {
         env: BTreeMap<String, String>,
     ) -> crate::mcp_client::McpStdioTransport {
         let python = python_invocation();
+        let args = python.script_args(script_path);
         crate::mcp_client::McpStdioTransport {
             command: python.command,
-            args: python.script_args(script_path),
+            args,
             env,
             tool_call_timeout_ms: None,
         }
@@ -1744,11 +1746,12 @@ mod tests {
         ]);
         env.extend(extra_env);
         let python = python_invocation();
+        let args = python.script_args(script_path);
         ScopedMcpServerConfig {
             scope: ConfigSource::Local,
             config: McpServerConfig::Stdio(McpStdioServerConfig {
                 command: python.command,
-                args: python.script_args(script_path),
+                args,
                 env,
                 tool_call_timeout_ms: None,
             }),
@@ -2222,13 +2225,15 @@ mod tests {
             let script_path = write_mcp_server_script();
             let root = script_path.parent().expect("script parent");
             let log_path = root.join("timeout.log");
+            let python = python_invocation();
+            let args = python.script_args(&script_path);
             let servers = BTreeMap::from([(
                 "slow".to_string(),
                 ScopedMcpServerConfig {
                     scope: ConfigSource::Local,
                     config: McpServerConfig::Stdio(McpStdioServerConfig {
-                        command: "python3".to_string(),
-                        args: vec![script_path.to_string_lossy().into_owned()],
+                        command: python.command,
+                        args,
                         env: BTreeMap::from([(
                             "MCP_TOOL_CALL_DELAY_MS".to_string(),
                             "200".to_string(),
@@ -2275,13 +2280,15 @@ mod tests {
             .expect("runtime");
         runtime.block_on(async {
             let script_path = write_mcp_server_script();
+            let python = python_invocation();
+            let args = python.script_args(&script_path);
             let servers = BTreeMap::from([(
                 "broken".to_string(),
                 ScopedMcpServerConfig {
                     scope: ConfigSource::Local,
                     config: McpServerConfig::Stdio(McpStdioServerConfig {
-                        command: "python3".to_string(),
-                        args: vec![script_path.to_string_lossy().into_owned()],
+                        command: python.command,
+                        args,
                         env: BTreeMap::from([(
                             "MCP_INVALID_TOOL_CALL_RESPONSE".to_string(),
                             "1".to_string(),
@@ -2577,6 +2584,9 @@ mod tests {
             let script_path = write_manager_mcp_server_script();
             let root = script_path.parent().expect("script parent");
             let alpha_log = root.join("alpha.log");
+            let python = python_invocation();
+            let mut broken_args = python.args.clone();
+            broken_args.extend(["-c".to_string(), "import sys; sys.exit(0)".to_string()]);
             let servers = BTreeMap::from([
                 (
                     "alpha".to_string(),
@@ -2587,8 +2597,8 @@ mod tests {
                     ScopedMcpServerConfig {
                         scope: ConfigSource::Local,
                         config: McpServerConfig::Stdio(McpStdioServerConfig {
-                            command: "python3".to_string(),
-                            args: vec!["-c".to_string(), "import sys; sys.exit(0)".to_string()],
+                            command: python.command,
+                            args: broken_args,
                             env: BTreeMap::new(),
                             tool_call_timeout_ms: None,
                         }),

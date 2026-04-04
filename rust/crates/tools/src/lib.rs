@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 use api::{
     max_tokens_for_model, resolve_model_alias, ContentBlockDelta, InputContentBlock, InputMessage,
     MessageRequest, MessageResponse, OutputContentBlock, ProviderClient, ProviderKind,
-    ProviderOverride,
-    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    ProviderOverride, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
+    ToolResultContentBlock,
 };
 use plugins::PluginTool;
 use reqwest::blocking::Client;
@@ -20,10 +20,10 @@ use runtime::{
     task_registry::TaskRegistry,
     team_cron_registry::{CronRegistry, TeamRegistry},
     worker_boot::{WorkerReadySnapshot, WorkerRegistry},
-    write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, ContentBlock,
-    ConversationMessage, ConversationRuntime, GrepSearchInput, MessageRole, PermissionMode,
-    PermissionPolicy, PromptCacheEvent, RuntimeError, RuntimeConfig, RuntimeProviderConfig,
-    RuntimeProviderKind, Session, TokenUsage, ToolError, ToolExecutor, ConfigLoader, OAuthConfig,
+    write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, ConfigLoader,
+    ContentBlock, ConversationMessage, ConversationRuntime, GrepSearchInput, MessageRole,
+    OAuthConfig, PermissionMode, PermissionPolicy, PromptCacheEvent, RuntimeConfig, RuntimeError,
+    RuntimeProviderConfig, RuntimeProviderKind, Session, TokenUsage, ToolError, ToolExecutor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};

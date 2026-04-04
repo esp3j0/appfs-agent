@@ -1445,6 +1445,10 @@ mod tests {
         format!("printf '{message}'")
     }
 
+    fn shell_snippet(command: &str) -> String {
+        command.to_string()
+    }
+
     fn shell_echo_and_exit(message: &str, code: i32) -> String {
         format!("printf '{message}'; exit {code}")
     }
