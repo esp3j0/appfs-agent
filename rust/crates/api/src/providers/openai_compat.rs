@@ -1102,6 +1102,7 @@ mod tests {
                 }]),
                 tool_choice: Some(ToolChoice::Auto),
                 stream: false,
+                ..Default::default()
             },
             OpenAiCompatConfig::xai(),
         );
@@ -1124,6 +1125,7 @@ mod tests {
                 tools: None,
                 tool_choice: None,
                 stream: true,
+            ..Default::default()
             },
             OpenAiCompatConfig::openai(),
         );
@@ -1142,6 +1144,7 @@ mod tests {
                 tools: None,
                 tool_choice: None,
                 stream: true,
+            ..Default::default()
             },
             OpenAiCompatConfig::xai(),
         );

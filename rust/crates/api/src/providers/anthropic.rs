@@ -1291,6 +1291,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             stream: false,
+        ..Default::default()
         };
 
         assert!(request.with_streaming().stream);
@@ -1481,6 +1482,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             stream: false,
+        ..Default::default()
         };
 
         let mut rendered = client
