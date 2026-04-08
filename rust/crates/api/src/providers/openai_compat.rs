@@ -1062,8 +1062,9 @@ impl StringExt for String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_chat_completion_request, chat_completions_endpoint, normalize_finish_reason,
-        openai_tool_choice, parse_tool_arguments, OpenAiCompatClient, OpenAiCompatConfig,
+        build_chat_completion_request, chat_completions_endpoint, is_reasoning_model,
+        normalize_finish_reason, openai_tool_choice, parse_tool_arguments, OpenAiCompatClient,
+        OpenAiCompatConfig,
     };
     use crate::error::ApiError;
     use crate::types::{
@@ -1125,7 +1126,7 @@ mod tests {
                 tools: None,
                 tool_choice: None,
                 stream: true,
-            ..Default::default()
+                ..Default::default()
             },
             OpenAiCompatConfig::openai(),
         );
@@ -1144,7 +1145,7 @@ mod tests {
                 tools: None,
                 tool_choice: None,
                 stream: true,
-            ..Default::default()
+                ..Default::default()
             },
             OpenAiCompatConfig::xai(),
         );
