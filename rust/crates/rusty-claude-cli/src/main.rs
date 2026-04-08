@@ -7041,6 +7041,7 @@ impl ApiClient for AnthropicRuntimeClient {
                 .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref())),
             tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
             stream: true,
+            ..Default::default()
         };
 
         self.runtime.block_on(async {
@@ -12008,6 +12009,9 @@ UU conflicted.rs",
 
     #[test]
     fn build_runtime_runs_plugin_lifecycle_init_and_shutdown() {
+        // Serialize access to process-wide env vars so parallel tests
+        // that set/remove ANTHROPIC_API_KEY do not race with this test.
+        let _guard = env_lock();
         if !windows_bash_smoke_ok() {
             return;
         }
