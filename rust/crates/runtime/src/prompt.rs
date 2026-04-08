@@ -246,7 +246,6 @@ fn read_git_status(cwd: &Path) -> Option<String> {
     }
 }
 
-
 fn read_git_diff(cwd: &Path) -> Option<String> {
     let mut sections = Vec::new();
 

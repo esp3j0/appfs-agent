@@ -1479,7 +1479,10 @@ mod workspace_sessions_dir_tests {
 
         let dir_a = workspace_sessions_dir(&tmp_a).expect("dir a");
         let dir_b = workspace_sessions_dir(&tmp_b).expect("dir b");
-        assert_ne!(dir_a, dir_b, "different CWDs must produce different session dirs");
+        assert_ne!(
+            dir_a, dir_b,
+            "different CWDs must produce different session dirs"
+        );
 
         fs::remove_dir_all(&tmp_a).ok();
         fs::remove_dir_all(&tmp_b).ok();

@@ -1496,10 +1496,14 @@ mod tests {
         // temperature is kept (Anthropic supports it)
         assert_eq!(body["temperature"], serde_json::json!(0.7));
         // frequency_penalty and presence_penalty are removed
-        assert!(body.get("frequency_penalty").is_none(),
-            "frequency_penalty must be stripped for Anthropic");
-        assert!(body.get("presence_penalty").is_none(),
-            "presence_penalty must be stripped for Anthropic");
+        assert!(
+            body.get("frequency_penalty").is_none(),
+            "frequency_penalty must be stripped for Anthropic"
+        );
+        assert!(
+            body.get("presence_penalty").is_none(),
+            "presence_penalty must be stripped for Anthropic"
+        );
         // stop is renamed to stop_sequences
         assert!(body.get("stop").is_none(), "stop must be renamed");
         assert_eq!(body["stop_sequences"], serde_json::json!(["\n"]));
@@ -1516,8 +1520,10 @@ mod tests {
         super::strip_unsupported_beta_body_fields(&mut body);
 
         assert!(body.get("stop").is_none());
-        assert!(body.get("stop_sequences").is_none(),
-            "empty stop should not produce stop_sequences");
+        assert!(
+            body.get("stop_sequences").is_none(),
+            "empty stop should not produce stop_sequences"
+        );
     }
 
     #[test]
