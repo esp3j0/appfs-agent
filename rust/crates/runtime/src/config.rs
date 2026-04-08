@@ -817,13 +817,6 @@ fn parse_provider_kind(value: &str, context: &str) -> Result<RuntimeProviderKind
     }
 }
 
-fn parse_optional_aliases(root: &JsonValue) -> Result<BTreeMap<String, String>, ConfigError> {
-    let Some(object) = root.as_object() else {
-        return Ok(BTreeMap::new());
-    };
-    Ok(optional_string_map(object, "aliases", "merged settings")?.unwrap_or_default())
-}
-
 fn parse_optional_hooks_config(root: &JsonValue) -> Result<RuntimeHookConfig, ConfigError> {
     let Some(object) = root.as_object() else {
         return Ok(RuntimeHookConfig::default());

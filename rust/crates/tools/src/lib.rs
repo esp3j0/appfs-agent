@@ -3782,6 +3782,7 @@ impl ProviderRuntimeClient {
         )
     }
 
+    #[cfg(test)]
     #[allow(clippy::needless_pass_by_value)]
     fn new_with_fallback_config(
         model: String,
@@ -3805,10 +3806,7 @@ impl ProviderRuntimeClient {
         fallback_config: &ProviderFallbackConfig,
         runtime_config: &RuntimeConfig,
     ) -> Result<Self, String> {
-        let primary_model = fallback_config
-            .primary()
-            .map(str::to_string)
-            .unwrap_or(model);
+        let primary_model = fallback_config.primary().map_or(model, str::to_string);
         let primary = build_provider_entry(&primary_model, runtime_config)?;
         let mut chain = vec![primary];
         for fallback_model in fallback_config.fallbacks() {
@@ -3834,8 +3832,8 @@ fn load_runtime_config_for_cwd() -> Result<RuntimeConfig, runtime::ConfigError> 
     ConfigLoader::default_for(cwd).load()
 }
 
-fn resolve_tool_auth_source(oauth: &Option<OAuthConfig>) -> Result<api::AuthSource, api::ApiError> {
-    api::resolve_startup_auth_source(|| Ok(oauth.clone()))
+fn resolve_tool_auth_source(oauth: Option<&OAuthConfig>) -> Result<api::AuthSource, api::ApiError> {
+    api::resolve_startup_auth_source(|| Ok(oauth.cloned()))
 }
 
 fn provider_override_from_runtime_config(config: &RuntimeProviderConfig) -> ProviderOverride {
@@ -3855,7 +3853,7 @@ fn build_provider_entry(
     model: &str,
     runtime_config: &RuntimeConfig,
 ) -> Result<ProviderEntry, String> {
-    let resolved = resolve_model_alias(model).to_string();
+    let resolved = resolve_model_alias(model).clone();
     let provider_override = runtime_config
         .provider()
         .map(provider_override_from_runtime_config);
@@ -3863,7 +3861,7 @@ fn build_provider_entry(
     let client = ProviderClient::from_model_with_anthropic_auth_resolver(
         &resolved,
         provider_override.as_ref(),
-        || resolve_tool_auth_source(&oauth),
+        || resolve_tool_auth_source(oauth.as_ref()),
     )
     .map_err(|error| error.to_string())?;
     Ok(ProviderEntry {
@@ -3911,17 +3909,15 @@ impl ApiClient for ProviderRuntimeClient {
                         entry.model
                     );
                     last_error = Some(error);
-                    continue;
                 }
                 Err(error) => return Err(RuntimeError::new(error.to_string())),
             }
         }
 
-        Err(RuntimeError::new(
-            last_error
-                .map(|error| error.to_string())
-                .unwrap_or_else(|| String::from("provider chain exhausted with no attempts")),
-        ))
+        Err(RuntimeError::new(last_error.map_or_else(
+            || String::from("provider chain exhausted with no attempts"),
+            |error| error.to_string(),
+        )))
     }
 }
 
@@ -5255,11 +5251,11 @@ fn command_path(command: &str) -> Option<String> {
         if !output.status.success() {
             return None;
         }
-        return String::from_utf8_lossy(&output.stdout)
+        String::from_utf8_lossy(&output.stdout)
             .lines()
             .map(str::trim)
             .find(|line| !line.is_empty())
-            .map(str::to_string);
+            .map(str::to_string)
     }
 
     #[cfg(not(windows))]

@@ -87,18 +87,21 @@ impl ProviderClient {
         F: FnOnce() -> Result<AuthSource, ApiError>,
     {
         let resolved_model = providers::resolve_model_alias(model);
-        let provider_kind = provider_override
-            .map(|config| config.provider)
-            .unwrap_or_else(|| providers::detect_provider_kind(&resolved_model));
+        let provider_kind = provider_override.map_or_else(
+            || providers::detect_provider_kind(&resolved_model),
+            |config| config.provider,
+        );
         match provider_kind {
             ProviderKind::Anthropic => Ok(Self::Anthropic(build_anthropic_client(
                 provider_override,
                 resolve_anthropic_auth,
             )?)),
-            ProviderKind::Xai => Ok(Self::Xai(OpenAiCompatClient::from_env(
+            ProviderKind::Xai => Ok(Self::Xai(build_openai_compat_client(
+                provider_override,
                 OpenAiCompatConfig::xai(),
             )?)),
-            ProviderKind::OpenAi => Ok(Self::OpenAi(OpenAiCompatClient::from_env(
+            ProviderKind::OpenAi => Ok(Self::OpenAi(build_openai_compat_client(
+                provider_override,
                 OpenAiCompatConfig::openai(),
             )?)),
         }
