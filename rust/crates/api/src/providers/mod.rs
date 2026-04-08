@@ -170,7 +170,11 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
             default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
         });
     }
-    if is_openai_model_name(&lower) {
+    // Explicit provider-namespaced models (e.g. "openai/gpt-4.1-mini") must
+    // route to the correct provider regardless of which auth env vars are set.
+    // Without this, detect_provider_kind falls through to the auth-sniffer
+    // order and misroutes to Anthropic if ANTHROPIC_API_KEY is present.
+    if canonical.starts_with("openai/") || is_openai_model_name(&lower) {
         return Some(ProviderMetadata {
             provider: ProviderKind::OpenAi,
             auth_env: "OPENAI_API_KEY",
@@ -415,6 +419,23 @@ mod tests {
             ProviderKind::OpenAi,
             "qwen/ prefix must win over auth-sniffer order"
         );
+    }
+
+    #[test]
+    fn openai_namespaced_model_routes_to_openai_not_anthropic() {
+        let kind = super::metadata_for_model("openai/gpt-4.1-mini")
+            .map(|m| m.provider)
+            .unwrap_or_else(|| detect_provider_kind("openai/gpt-4.1-mini"));
+        assert_eq!(
+            kind,
+            ProviderKind::OpenAi,
+            "openai/ prefix must route to OpenAi regardless of ANTHROPIC_API_KEY"
+        );
+
+        let kind2 = super::metadata_for_model("gpt-4o")
+            .map(|m| m.provider)
+            .unwrap_or_else(|| detect_provider_kind("gpt-4o"));
+        assert_eq!(kind2, ProviderKind::OpenAi);
     }
 
     #[test]
