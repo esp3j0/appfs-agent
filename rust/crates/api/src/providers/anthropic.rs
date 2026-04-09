@@ -18,8 +18,8 @@ use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 
 use super::{
     anthropic_missing_credentials, model_token_limit,
-    preflight_message_request as estimate_preflight_message_request, resolve_model_alias,
-    Provider, ProviderFuture,
+    preflight_message_request as estimate_preflight_message_request, resolve_model_alias, Provider,
+    ProviderFuture,
 };
 use crate::sse::SseParser;
 use crate::types::{MessageDeltaEvent, MessageRequest, MessageResponse, StreamEvent, Usage};
@@ -1040,11 +1040,7 @@ struct AnthropicErrorBody {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-    anthropic_missing_credentials, model_token_limit,
-    preflight_message_request as estimate_preflight_message_request, resolve_model_alias,
-    Provider, ProviderFuture,
-};
+    use super::{ALT_REQUEST_ID_HEADER, REQUEST_ID_HEADER};
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::{Mutex, OnceLock};
@@ -1054,10 +1050,9 @@ mod tests {
     use runtime::{clear_oauth_credentials, save_oauth_credentials, OAuthConfig};
 
     use super::{
-    anthropic_missing_credentials, model_token_limit,
-    preflight_message_request as estimate_preflight_message_request, resolve_model_alias,
-    Provider, ProviderFuture,
-};
+        now_unix_timestamp, oauth_token_is_expired, resolve_saved_oauth_token,
+        resolve_startup_auth_source, AnthropicClient, AuthSource, OAuthTokenSet,
+    };
     use crate::types::{ContentBlockDelta, MessageRequest};
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
