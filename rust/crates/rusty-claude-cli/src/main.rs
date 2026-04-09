@@ -237,7 +237,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             allowed_tools,
             permission_mode,
             base_commit,
-        } => run_repl(model, allowed_tools, permission_mode, base_commit)?,
+        } => run_repl(
+            model,
+            allowed_tools,
+            permission_mode,
+            base_commit.as_deref(),
+        )?,
         CliAction::HelpTopic(topic) => print_help_topic(topic),
         CliAction::Help { output_format } => print_help(output_format)?,
     }
@@ -1090,7 +1095,7 @@ fn parse_export_args(args: &[String], output_format: CliOutputFormat) -> Result<
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| "missing value for --session".to_string())?;
-                session_reference = value.clone();
+                session_reference.clone_from(value);
                 index += 2;
             }
             flag if flag.starts_with("--session=") => {
@@ -2967,10 +2972,7 @@ fn run_resume_command(
 /// commit (from `--base-commit` flag or `.claw-base` file). Emits a warning to
 /// stderr when the HEAD has diverged.
 fn run_stale_base_preflight(flag_value: Option<&str>) {
-    let cwd = match env::current_dir() {
-        Ok(cwd) => cwd,
-        Err(_) => return,
-    };
+    let Ok(cwd) = env::current_dir() else { return };
     let source = resolve_expected_base(flag_value, &cwd);
     let state = check_base_commit(&cwd, source.as_ref());
     if let Some(warning) = format_stale_base_warning(&state) {
@@ -2982,9 +2984,9 @@ fn run_repl(
     model: String,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
-    base_commit: Option<String>,
+    base_commit: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    run_stale_base_preflight(base_commit.as_deref());
+    run_stale_base_preflight(base_commit);
     let resolved_model = resolve_repl_model(model);
     let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
     let mut editor =
@@ -3009,12 +3011,10 @@ fn run_repl(
                         if cli.handle_repl_command(command)? {
                             cli.persist_session()?;
                         }
-                        continue;
                     }
                     Ok(None) => {}
                     Err(error) => {
                         eprintln!("{error}");
-                        continue;
                     }
                 }
                 editor.push_history(input);
@@ -4272,6 +4272,7 @@ impl LiveCli {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn handle_session_command(
         &mut self,
         action: Option<&str>,
@@ -4917,33 +4918,36 @@ fn status_json_value(
             "discovered_config_files": context.discovered_config_files,
             "memory_file_count": context.memory_file_count,
         },
-        "appfs": context.appfs_environment.as_ref().map(|environment| {
-            json!({
-                "detected": true,
-                "attach_source": environment.attach_source.as_str(),
-                "mount_root": environment.mount_root,
-                "runtime_session_id": environment.runtime_session_id,
-                "attach_id": environment.attach_id,
-                "attach_role": environment.attach_role,
-                "multi_agent_mode": environment.multi_agent_mode,
-                "manifest_path": environment.manifest_path,
-                "control_dir": environment.control_dir,
-                "control_events_path": environment.control_events_path,
-                "registry_path": environment.registry_path,
-                "register_app_path": environment.register_app_path,
-                "unregister_app_path": environment.unregister_app_path,
-                "list_apps_path": environment.list_apps_path,
-                "current_app_id": environment.current_app_id,
-                "current_app_root": environment.current_app_root,
-                "current_app_events_path": environment.current_app_events_path,
-                "registered_apps": environment.registered_apps,
-                "warnings": environment.warnings,
-            })
-        }).unwrap_or_else(|| {
-            json!({
-                "detected": false
-            })
-        }),
+        "appfs": context.appfs_environment.as_ref().map_or_else(
+            || {
+                json!({
+                    "detected": false
+                })
+            },
+            |environment| {
+                json!({
+                    "detected": true,
+                    "attach_source": environment.attach_source.as_str(),
+                    "mount_root": environment.mount_root,
+                    "runtime_session_id": environment.runtime_session_id,
+                    "attach_id": environment.attach_id,
+                    "attach_role": environment.attach_role,
+                    "multi_agent_mode": environment.multi_agent_mode,
+                    "manifest_path": environment.manifest_path,
+                    "control_dir": environment.control_dir,
+                    "control_events_path": environment.control_events_path,
+                    "registry_path": environment.registry_path,
+                    "register_app_path": environment.register_app_path,
+                    "unregister_app_path": environment.unregister_app_path,
+                    "list_apps_path": environment.list_apps_path,
+                    "current_app_id": environment.current_app_id,
+                    "current_app_root": environment.current_app_root,
+                    "current_app_events_path": environment.current_app_events_path,
+                    "registered_apps": environment.registered_apps,
+                    "warnings": environment.warnings,
+                })
+            },
+        ),
         "sandbox": {
             "enabled": context.sandbox_status.enabled,
             "active": context.sandbox_status.active,
@@ -5389,7 +5393,7 @@ fn collect_hook_list_entries(
     let mut entries = Vec::new();
     extend_hook_list_entries(
         &mut entries,
-        "config".to_string(),
+        "config",
         true,
         runtime_config.hooks().pre_tool_use(),
         runtime_config.hooks().post_tool_use(),
@@ -5401,7 +5405,7 @@ fn collect_hook_list_entries(
     for plugin in plugin_registry.plugins() {
         extend_hook_list_entries(
             &mut entries,
-            format!("plugin:{}", plugin.metadata().id),
+            &format!("plugin:{}", plugin.metadata().id),
             plugin.is_enabled(),
             &plugin.hooks().pre_tool_use,
             &plugin.hooks().post_tool_use,
@@ -5414,17 +5418,17 @@ fn collect_hook_list_entries(
 
 fn extend_hook_list_entries(
     entries: &mut Vec<HookListEntry>,
-    source: String,
+    source: &str,
     enabled: bool,
     pre_tool_use: &[String],
     post_tool_use: &[String],
     post_tool_use_failure: &[String],
 ) {
-    append_hook_list_entries(entries, &source, enabled, "PreToolUse", pre_tool_use);
-    append_hook_list_entries(entries, &source, enabled, "PostToolUse", post_tool_use);
+    append_hook_list_entries(entries, source, enabled, "PreToolUse", pre_tool_use);
+    append_hook_list_entries(entries, source, enabled, "PostToolUse", post_tool_use);
     append_hook_list_entries(
         entries,
-        &source,
+        source,
         enabled,
         "PostToolUseFailure",
         post_tool_use_failure,
@@ -6001,15 +6005,19 @@ fn civil_from_days(days: i64) -> (i32, u32, u32) {
     } else {
         (z - 146_096) / 146_097
     };
-    let doe = (z - era * 146_097) as u64; // [0, 146_096]
+    let doe = (z - era * 146_097).cast_unsigned(); // [0, 146_096]
     let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
-    let y = yoe as i64 + era * 400;
+    let y = yoe.cast_signed() + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
     let mp = (5 * doy + 2) / 153; // [0, 11]
     let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
     let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
     let y = y + i64::from(m <= 2);
-    (y as i32, m as u32, d as u32)
+    (
+        i32::try_from(y).expect("civil year should fit in i32"),
+        u32::try_from(m).expect("month should fit in u32"),
+        u32::try_from(d).expect("day should fit in u32"),
+    )
 }
 
 fn render_prompt_history_report(entries: &[PromptHistoryEntry], limit: usize) -> String {
@@ -6999,7 +7007,7 @@ impl AnthropicRuntimeClient {
         progress_reporter: Option<InternalPromptProgressReporter>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let runtime_config = load_runtime_config_for_cwd(&env::current_dir()?)
-            .map_err(|error| Box::<dyn std::error::Error>::from(error))?;
+            .map_err(Box::<dyn std::error::Error>::from)?;
         let provider_override = runtime_config
             .provider()
             .map(provider_override_from_runtime_config);
@@ -7009,7 +7017,7 @@ impl AnthropicRuntimeClient {
             client: ProviderClient::from_model_with_anthropic_auth_resolver(
                 &model,
                 provider_override.as_ref(),
-                || resolve_cli_auth_source(&oauth),
+                || resolve_cli_auth_source(oauth.as_ref()),
             )?
             .with_prompt_cache(PromptCache::new(session_id)),
             session_id: session_id.to_string(),
@@ -7023,8 +7031,8 @@ impl AnthropicRuntimeClient {
     }
 }
 
-fn resolve_cli_auth_source(oauth: &Option<OAuthConfig>) -> Result<AuthSource, api::ApiError> {
-    if let Some(oauth) = oauth.clone() {
+fn resolve_cli_auth_source(oauth: Option<&OAuthConfig>) -> Result<AuthSource, api::ApiError> {
+    if let Some(oauth) = oauth.cloned() {
         resolve_startup_auth_source(|| Ok(Some(oauth)))
     } else {
         let cwd = env::current_dir().map_err(api::ApiError::Io)?;
@@ -7111,7 +7119,6 @@ impl ApiClient for AnthropicRuntimeClient {
                     {
                         // Stalled after tool completion — nudge the model by
                         // re-sending the same request.
-                        continue;
                     }
                     Err(error) => return Err(error),
                 }
@@ -8678,8 +8685,6 @@ mod tests {
         const ATTEMPTS: usize = 6;
         for attempt in 0..ATTEMPTS {
             match fs::remove_dir_all(path) {
-                Ok(()) => return,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
                 Err(error)
                     if attempt + 1 < ATTEMPTS
                         && matches!(
@@ -8689,7 +8694,7 @@ mod tests {
                 {
                     std::thread::sleep(Duration::from_millis(25 * (attempt as u64 + 1)));
                 }
-                Err(_) => return,
+                _ => return,
             }
         }
     }
@@ -10411,6 +10416,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn status_line_reports_model_and_token_totals() {
         let status = format_status_report(
             "claude-sonnet",

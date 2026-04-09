@@ -25,7 +25,7 @@ pub fn set_shell_if_windows() -> io::Result<()> {
 pub fn bash_shell_path() -> io::Result<PathBuf> {
     #[cfg(windows)]
     {
-        return resolve_windows_bash_shell_path();
+        resolve_windows_bash_shell_path()
     }
 
     #[cfg(not(windows))]
@@ -35,6 +35,7 @@ pub fn bash_shell_path() -> io::Result<PathBuf> {
 }
 
 #[cfg(windows)]
+#[must_use]
 pub fn windows_path_to_posix_path(path: &Path) -> String {
     let path = path.to_string_lossy();
     if let Some(rest) = path.strip_prefix(r"\\") {
@@ -53,17 +54,17 @@ pub fn windows_path_to_posix_path(path: &Path) -> String {
 
 #[cfg(windows)]
 fn resolve_windows_bash_shell_path() -> io::Result<PathBuf> {
-    if let Some(path) = resolve_supported_shell_from_env(&SHELL_OVERRIDE_ENV_VARS)? {
+    if let Some(path) = resolve_supported_shell_from_env(&SHELL_OVERRIDE_ENV_VARS) {
         return Ok(path);
     }
-    if let Some(path) = resolve_supported_shell_from_env(&["SHELL"])? {
+    if let Some(path) = resolve_supported_shell_from_env(&["SHELL"]) {
         return Ok(path);
     }
     find_git_bash_path()
 }
 
 #[cfg(windows)]
-fn resolve_supported_shell_from_env(names: &[&str]) -> io::Result<Option<PathBuf>> {
+fn resolve_supported_shell_from_env(names: &[&str]) -> Option<PathBuf> {
     for name in names {
         if let Some(value) = env::var_os(name) {
             let candidate = PathBuf::from(value);
@@ -71,12 +72,12 @@ fn resolve_supported_shell_from_env(names: &[&str]) -> io::Result<Option<PathBuf
                 continue;
             }
             if is_supported_shell_path(&candidate) {
-                return Ok(Some(candidate));
+                return Some(candidate);
             }
         }
     }
 
-    Ok(None)
+    None
 }
 
 #[cfg(windows)]

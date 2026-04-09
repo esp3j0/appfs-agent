@@ -58,10 +58,10 @@ impl OpenAiCompatConfig {
         }
     }
 
-    /// Alibaba DashScope compatible-mode endpoint (Qwen family models).
+    /// Alibaba `DashScope` compatible-mode endpoint (Qwen family models).
     /// Uses the OpenAI-compatible REST shape at /compatible-mode/v1.
     /// Requested via Discord #clawcode-get-help: native Alibaba API for
-    /// higher rate limits than going through OpenRouter.
+    /// higher rate limits than going through `OpenRouter`.
     #[must_use]
     pub const fn dashscope() -> Self {
         Self {
@@ -702,8 +702,8 @@ struct ErrorBody {
     message: Option<String>,
 }
 
-/// Returns true for models known to reject tuning parameters like temperature,
-/// top_p, frequency_penalty, and presence_penalty. These are typically
+/// Returns true for models known to reject tuning parameters like `temperature`,
+/// `top_p`, `frequency_penalty`, and `presence_penalty`. These are typically
 /// reasoning/chain-of-thought models with fixed sampling.
 fn is_reasoning_model(model: &str) -> bool {
     let lowered = model.to_ascii_lowercase();

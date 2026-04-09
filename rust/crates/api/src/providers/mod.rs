@@ -423,9 +423,10 @@ mod tests {
 
     #[test]
     fn openai_namespaced_model_routes_to_openai_not_anthropic() {
-        let kind = super::metadata_for_model("openai/gpt-4.1-mini")
-            .map(|m| m.provider)
-            .unwrap_or_else(|| detect_provider_kind("openai/gpt-4.1-mini"));
+        let kind = super::metadata_for_model("openai/gpt-4.1-mini").map_or_else(
+            || detect_provider_kind("openai/gpt-4.1-mini"),
+            |m| m.provider,
+        );
         assert_eq!(
             kind,
             ProviderKind::OpenAi,
@@ -433,8 +434,7 @@ mod tests {
         );
 
         let kind2 = super::metadata_for_model("gpt-4o")
-            .map(|m| m.provider)
-            .unwrap_or_else(|| detect_provider_kind("gpt-4o"));
+            .map_or_else(|| detect_provider_kind("gpt-4o"), |m| m.provider);
         assert_eq!(kind2, ProviderKind::OpenAi);
     }
 
