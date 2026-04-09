@@ -203,6 +203,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             permission_mode,
             compact,
             base_commit,
+            ..
         } => {
             run_stale_base_preflight(base_commit.as_deref());
             // Only consume piped stdin as prompt context when the permission
@@ -237,6 +238,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             allowed_tools,
             permission_mode,
             base_commit,
+            ..
         } => run_repl(
             model,
             allowed_tools,
@@ -300,6 +302,7 @@ enum CliAction {
         permission_mode: PermissionMode,
         compact: bool,
         base_commit: Option<String>,
+        reasoning_effort: Option<String>,
     },
     Login {
         output_format: CliOutputFormat,
@@ -324,6 +327,7 @@ enum CliAction {
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
         base_commit: Option<String>,
+        reasoning_effort: Option<String>,
     },
     HelpTopic(LocalHelpTopic),
     // prompt-mode formatting is only supported for non-interactive runs
@@ -450,6 +454,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                         .unwrap_or_else(default_permission_mode),
                     compact,
                     base_commit: base_commit.clone(),
+                    reasoning_effort: None,
                 });
             }
             "--print" => {
@@ -508,6 +513,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             allowed_tools,
             permission_mode,
             base_commit,
+            reasoning_effort: None,
         });
     }
     if rest.first().map(String::as_str) == Some("--resume") {
@@ -547,6 +553,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     permission_mode,
                     compact,
                     base_commit,
+                    reasoning_effort: None,
                 }),
                 SkillSlashDispatch::Local => Ok(CliAction::Skills {
                     args,
@@ -575,6 +582,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 permission_mode,
                 compact,
                 base_commit: base_commit.clone(),
+                reasoning_effort: None,
             })
         }
         other if other.starts_with('/') => parse_direct_slash_cli_action(
@@ -594,6 +602,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             permission_mode,
             compact,
             base_commit,
+            reasoning_effort: None,
         }),
     }
 }
@@ -714,6 +723,7 @@ fn parse_direct_slash_cli_action(
                     permission_mode,
                     compact,
                     base_commit,
+                    reasoning_effort: None,
                 }),
                 SkillSlashDispatch::Local => Ok(CliAction::Skills {
                     args,
@@ -8880,6 +8890,7 @@ mod tests {
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
     }
@@ -9043,6 +9054,7 @@ mod tests {
                 permission_mode: PermissionMode::DangerFullAccess,
                 compact: false,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
     }
@@ -9151,6 +9163,7 @@ mod tests {
                 permission_mode: PermissionMode::DangerFullAccess,
                 compact: false,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
     }
@@ -9180,6 +9193,7 @@ mod tests {
                 permission_mode: PermissionMode::DangerFullAccess,
                 compact: true,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
     }
@@ -9221,6 +9235,7 @@ mod tests {
                 permission_mode: PermissionMode::DangerFullAccess,
                 compact: false,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
     }
@@ -9298,6 +9313,7 @@ mod tests {
                 allowed_tools: None,
                 permission_mode: PermissionMode::ReadOnly,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
     }
@@ -9317,6 +9333,7 @@ mod tests {
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
     }
@@ -9345,6 +9362,7 @@ mod tests {
                 permission_mode: PermissionMode::DangerFullAccess,
                 compact: false,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
     }
@@ -9370,6 +9388,7 @@ mod tests {
                 ),
                 permission_mode: PermissionMode::DangerFullAccess,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
     }
@@ -9462,6 +9481,7 @@ mod tests {
                 permission_mode: crate::default_permission_mode(),
                 compact: false,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
         assert_eq!(
@@ -9899,6 +9919,7 @@ mod tests {
                 permission_mode: crate::default_permission_mode(),
                 compact: false,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
     }
@@ -9950,6 +9971,7 @@ mod tests {
                 permission_mode: crate::default_permission_mode(),
                 compact: false,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
         assert_eq!(
@@ -9975,6 +9997,7 @@ mod tests {
                 permission_mode: crate::default_permission_mode(),
                 compact: false,
                 base_commit: None,
+                reasoning_effort: None,
             }
         );
         let error = parse_args(&["/status".to_string()])
