@@ -26,6 +26,10 @@ pub struct MessageRequest {
     pub presence_penalty: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop: Option<Vec<String>>,
+    /// Reasoning effort level for OpenAI-compatible reasoning models.
+    /// Accepted values include `"low"`, `"medium"`, and `"high"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 impl MessageRequest {
