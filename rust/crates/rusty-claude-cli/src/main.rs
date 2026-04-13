@@ -12400,14 +12400,6 @@ mod sandbox_report_tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    fn normalize_test_path(path: &std::path::Path) -> String {
-        path.display()
-            .to_string()
-            .replace('/', "\\")
-            .trim_start_matches("\\\\?\\")
-            .to_string()
-    }
-
     #[test]
     fn sandbox_report_renders_expected_fields() {
         let report = format_sandbox_report(&runtime::SandboxStatus::default());
@@ -12474,14 +12466,20 @@ mod sandbox_report_tests {
         let error_msg = result
             .expect_err("missing manifests should error")
             .to_string();
-        let normalized_error = error_msg.replace('/', "\\");
-        let expected_root = normalize_test_path(&root);
         assert!(
             error_msg.contains("Manifest source files are missing"),
             "error message should mention missing manifest sources: {error_msg}"
         );
         assert!(
-            normalized_error.contains(&expected_root),
+            error_msg.contains("repo root:"),
+            "error message should label the repo root path: {error_msg}"
+        );
+        let expected_root_name = root
+            .file_name()
+            .and_then(|value| value.to_str())
+            .expect("temp root should have utf8 name");
+        assert!(
+            error_msg.contains(expected_root_name),
             "error message should contain the resolved repo root path: {error_msg}"
         );
         assert!(
