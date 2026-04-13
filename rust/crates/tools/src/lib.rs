@@ -21,7 +21,7 @@ use runtime::{
     summary_compression::compress_summary_text,
     task_registry::TaskRegistry,
     team_cron_registry::{CronRegistry, TeamRegistry},
-    worker_boot::{WorkerReadySnapshot, WorkerRegistry},
+    worker_boot::{WorkerReadySnapshot, WorkerRegistry, WorkerTaskReceipt},
     write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, BashCommandOutput,
     BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage, ConversationRuntime,
     GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneEventName,
@@ -931,7 +931,22 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {
                     "worker_id": { "type": "string" },
-                    "prompt": { "type": "string" }
+                    "prompt": { "type": "string" },
+                    "task_receipt": {
+                        "type": "object",
+                        "properties": {
+                            "repo": { "type": "string" },
+                            "task_kind": { "type": "string" },
+                            "source_surface": { "type": "string" },
+                            "expected_artifacts": {
+                                "type": "array",
+                                "items": { "type": "string" }
+                            },
+                            "objective_preview": { "type": "string" }
+                        },
+                        "required": ["repo", "task_kind", "source_surface", "objective_preview"],
+                        "additionalProperties": false
+                    }
                 },
                 "required": ["worker_id"],
                 "additionalProperties": false
@@ -1503,7 +1518,11 @@ fn run_worker_await_ready(input: WorkerIdInput) -> Result<String, String> {
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_worker_send_prompt(input: WorkerSendPromptInput) -> Result<String, String> {
-    let worker = global_worker_registry().send_prompt(&input.worker_id, input.prompt.as_deref())?;
+    let worker = global_worker_registry().send_prompt(
+        &input.worker_id,
+        input.prompt.as_deref(),
+        input.task_receipt,
+    )?;
     to_pretty_json(worker)
 }
 
@@ -2281,6 +2300,8 @@ struct WorkerSendPromptInput {
     worker_id: String,
     #[serde(default)]
     prompt: Option<String>,
+    #[serde(default)]
+    task_receipt: Option<WorkerTaskReceipt>,
 }
 
 const fn default_auto_recover_prompt_misdelivery() -> bool {
@@ -5514,6 +5535,24 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    fn env_guard_recovers_after_poisoning() {
+        let poisoned = std::thread::spawn(|| {
+            let _guard = env_guard();
+            panic!("poison env lock");
+        })
+        .join();
+        assert!(poisoned.is_err(), "poisoning thread should panic");
+
+        let _guard = env_guard();
     }
 
     fn temp_path(name: &str) -> PathBuf {
