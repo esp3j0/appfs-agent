@@ -162,7 +162,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
     set_shell_if_windows()?;
     match parse_args(&args)? {
-        CliAction::DumpManifests { output_format } => dump_manifests(output_format)?,
+        CliAction::DumpManifests {
+            output_format,
+            manifests_dir,
+        } => dump_manifests(manifests_dir.as_deref(), output_format)?,
         CliAction::BootstrapPlan { output_format } => print_bootstrap_plan(output_format)?,
         CliAction::Agents {
             args,
@@ -255,6 +258,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 enum CliAction {
     DumpManifests {
         output_format: CliOutputFormat,
+        manifests_dir: Option<PathBuf>,
     },
     BootstrapPlan {
         output_format: CliOutputFormat,
@@ -531,7 +535,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
 
     match rest[0].as_str() {
-        "dump-manifests" => Ok(CliAction::DumpManifests { output_format }),
+        "dump-manifests" => parse_dump_manifests_args(&rest[1..], output_format),
         "bootstrap-plan" => Ok(CliAction::BootstrapPlan { output_format }),
         "agents" => Ok(CliAction::Agents {
             args: join_optional_args(&rest[1..]),
@@ -1142,6 +1146,40 @@ fn parse_export_args(args: &[String], output_format: CliOutputFormat) -> Result<
         output_format,
     })
 }
+
+fn parse_dump_manifests_args(
+    args: &[String],
+    output_format: CliOutputFormat,
+) -> Result<CliAction, String> {
+    let mut manifests_dir: Option<PathBuf> = None;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--manifests-dir" {
+            let value = args
+                .get(index + 1)
+                .ok_or_else(|| String::from("--manifests-dir requires a path"))?;
+            manifests_dir = Some(PathBuf::from(value));
+            index += 2;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--manifests-dir=") {
+            if value.is_empty() {
+                return Err(String::from("--manifests-dir requires a path"));
+            }
+            manifests_dir = Some(PathBuf::from(value));
+            index += 1;
+            continue;
+        }
+        return Err(format!("unknown dump-manifests option: {arg}"));
+    }
+
+    Ok(CliAction::DumpManifests {
+        output_format,
+        manifests_dir,
+    })
+}
+
 fn parse_resume_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
     let (session_path, command_tokens): (PathBuf, &[String]) = match args.first() {
         None => (PathBuf::from(LATEST_SESSION_REFERENCE), &[]),
@@ -1841,9 +1879,66 @@ fn looks_like_slash_command_token(token: &str) -> bool {
         .any(|spec| spec.name == name || spec.aliases.contains(&name))
 }
 
-fn dump_manifests(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+fn dump_manifests(
+    manifests_dir: Option<&Path>,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
     let workspace_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let paths = UpstreamPaths::from_workspace_dir(&workspace_dir);
+    dump_manifests_at_path(&workspace_dir, manifests_dir, output_format)
+}
+
+const DUMP_MANIFESTS_OVERRIDE_HINT: &str =
+    "Hint: set CLAUDE_CODE_UPSTREAM=/path/to/upstream or pass `claw dump-manifests --manifests-dir /path/to/upstream`.";
+
+fn upstream_repo_root(paths: &UpstreamPaths) -> PathBuf {
+    paths
+        .commands_path()
+        .parent()
+        .and_then(Path::parent)
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+}
+
+fn dump_manifests_at_path(
+    workspace_dir: &Path,
+    manifests_dir: Option<&Path>,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let paths = if let Some(dir) = manifests_dir {
+        let resolved = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        UpstreamPaths::from_repo_root(resolved)
+    } else {
+        let resolved = workspace_dir
+            .canonicalize()
+            .unwrap_or_else(|_| workspace_dir.to_path_buf());
+        UpstreamPaths::from_workspace_dir(&resolved)
+    };
+    let source_root = upstream_repo_root(&paths);
+    if !source_root.exists() {
+        return Err(format!(
+            "Manifest source directory does not exist.\n  looked in: {}\n  {DUMP_MANIFESTS_OVERRIDE_HINT}",
+            source_root.display(),
+        )
+        .into());
+    }
+
+    let required_paths = [
+        ("src/commands.ts", paths.commands_path()),
+        ("src/tools.ts", paths.tools_path()),
+        ("src/entrypoints/cli.tsx", paths.cli_path()),
+    ];
+    let missing = required_paths
+        .iter()
+        .filter_map(|(label, path)| (!path.is_file()).then_some(*label))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(format!(
+            "Manifest source files are missing.\n  repo root: {}\n  missing: {}\n  {DUMP_MANIFESTS_OVERRIDE_HINT}",
+            source_root.display(),
+            missing.join(", "),
+        )
+        .into());
+    }
+
     match extract_manifest(&paths) {
         Ok(manifest) => {
             match output_format {
@@ -1864,7 +1959,11 @@ fn dump_manifests(output_format: CliOutputFormat) -> Result<(), Box<dyn std::err
             }
             Ok(())
         }
-        Err(error) => Err(format!("failed to extract manifests: {error}").into()),
+        Err(error) => Err(format!(
+            "failed to extract manifests: {error}\n  looked in: {}\n  {DUMP_MANIFESTS_OVERRIDE_HINT}",
+            source_root.display()
+        )
+        .into()),
     }
 }
 
@@ -3052,6 +3151,7 @@ struct SessionHandle {
 struct ManagedSessionSummary {
     id: String,
     path: PathBuf,
+    updated_at_ms: u64,
     modified_epoch_millis: u128,
     message_count: usize,
     parent_session_id: Option<String>,
@@ -4662,7 +4762,7 @@ fn collect_sessions_from_dir(
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
             .map(|duration| duration.as_millis())
             .unwrap_or_default();
-        let (id, message_count, parent_session_id, branch_name) =
+        let (id, updated_at_ms, message_count, parent_session_id, branch_name) =
             match Session::load_from_path(&path) {
                 Ok(session) => {
                     let parent_session_id = session
@@ -4675,6 +4775,7 @@ fn collect_sessions_from_dir(
                         .and_then(|fork| fork.branch_name.clone());
                     (
                         session.session_id,
+                        session.updated_at_ms,
                         session.messages.len(),
                         parent_session_id,
                         branch_name,
@@ -4686,6 +4787,7 @@ fn collect_sessions_from_dir(
                         .unwrap_or("unknown")
                         .to_string(),
                     0,
+                    0,
                     None,
                     None,
                 ),
@@ -4693,6 +4795,7 @@ fn collect_sessions_from_dir(
         sessions.push(ManagedSessionSummary {
             id,
             path,
+            updated_at_ms,
             modified_epoch_millis,
             message_count,
             parent_session_id,
@@ -4719,8 +4822,9 @@ fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::er
 
     sessions.sort_by(|left, right| {
         right
-            .modified_epoch_millis
-            .cmp(&left.modified_epoch_millis)
+            .updated_at_ms
+            .cmp(&left.updated_at_ms)
+            .then_with(|| right.modified_epoch_millis.cmp(&left.modified_epoch_millis))
             .then_with(|| right.id.cmp(&left.id))
     });
     Ok(sessions)
@@ -8333,7 +8437,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(out, "  claw sandbox")?;
     writeln!(out, "      Show the current sandbox isolation snapshot")?;
-    writeln!(out, "  claw dump-manifests")?;
+    writeln!(out, "  claw dump-manifests [--manifests-dir PATH]")?;
     writeln!(out, "  claw bootstrap-plan")?;
     writeln!(out, "  claw agents")?;
     writeln!(out, "  claw mcp")?;
@@ -9140,6 +9244,33 @@ mod tests {
         std::env::remove_var("CLAW_TEST_PERMISSION_PROMPT_RESPONSE");
 
         assert_eq!(decision, Some(PermissionPromptDecision::Allow));
+    }
+
+    #[test]
+    fn dump_manifests_subcommand_accepts_explicit_manifest_dir() {
+        assert_eq!(
+            parse_args(&[
+                "dump-manifests".to_string(),
+                "--manifests-dir".to_string(),
+                "/tmp/upstream".to_string(),
+            ])
+            .expect("dump-manifests should parse"),
+            CliAction::DumpManifests {
+                output_format: CliOutputFormat::Text,
+                manifests_dir: Some(PathBuf::from("/tmp/upstream")),
+            }
+        );
+        assert_eq!(
+            parse_args(&[
+                "dump-manifests".to_string(),
+                "--manifests-dir=/tmp/upstream".to_string(),
+            ])
+            .expect("inline dump-manifests flag should parse"),
+            CliAction::DumpManifests {
+                output_format: CliOutputFormat::Text,
+                manifests_dir: Some(PathBuf::from("/tmp/upstream")),
+            }
+        );
     }
 
     #[test]
@@ -11200,9 +11331,7 @@ UU conflicted.rs",
 
     #[test]
     fn managed_sessions_default_to_jsonl_and_resolve_legacy_json() {
-        let _guard = cwd_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = cwd_guard();
         let workspace = temp_workspace("session-resolution");
         std::fs::create_dir_all(&workspace).expect("workspace should create");
         let previous = std::env::current_dir().expect("cwd");
@@ -11242,9 +11371,7 @@ UU conflicted.rs",
 
     #[test]
     fn latest_session_alias_resolves_most_recent_managed_session() {
-        let _guard = cwd_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = cwd_guard();
         let workspace = temp_workspace("latest-session-alias");
         std::fs::create_dir_all(&workspace).expect("workspace should create");
         let previous = std::env::current_dir().expect("cwd");
@@ -11296,6 +11423,24 @@ UU conflicted.rs",
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    fn cwd_guard() -> MutexGuard<'static, ()> {
+        cwd_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    fn cwd_guard_recovers_after_poisoning() {
+        let poisoned = std::thread::spawn(|| {
+            let _guard = cwd_guard();
+            panic!("poison cwd lock");
+        })
+        .join();
+        assert!(poisoned.is_err(), "poisoning thread should panic");
+
+        let _guard = cwd_guard();
+    }
+
     fn temp_workspace(label: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -11306,9 +11451,7 @@ UU conflicted.rs",
 
     #[test]
     fn init_template_mentions_detected_rust_workspace() {
-        let _guard = cwd_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = cwd_guard();
         let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let rendered = crate::init::render_init_claude_md(&workspace_root);
         assert!(rendered.contains("# CLAUDE.md"));
@@ -12252,7 +12395,7 @@ fn write_mcp_server_fixture(script_path: &Path) {
 
 #[cfg(test)]
 mod sandbox_report_tests {
-    use super::{format_sandbox_report, HookAbortMonitor};
+    use super::{dump_manifests_at_path, format_sandbox_report, CliOutputFormat, HookAbortMonitor};
     use runtime::HookAbortSignal;
     use std::sync::mpsc;
     use std::time::Duration;
@@ -12303,5 +12446,79 @@ mod sandbox_report_tests {
         monitor.stop();
 
         assert!(abort_signal.is_aborted());
+    }
+
+    #[test]
+    fn dump_manifests_shows_helpful_error_when_manifests_missing() {
+        let root = std::env::temp_dir().join(format!(
+            "claw_test_missing_manifests_{}",
+            std::process::id()
+        ));
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("failed to create temp workspace");
+
+        let result = dump_manifests_at_path(&workspace, None, CliOutputFormat::Text);
+        assert!(
+            result.is_err(),
+            "expected an error when manifests are missing"
+        );
+
+        let error_msg = result
+            .expect_err("missing manifests should error")
+            .to_string();
+        assert!(
+            error_msg.contains("Manifest source files are missing"),
+            "error message should mention missing manifest sources: {error_msg}"
+        );
+        assert!(
+            error_msg.contains(&root.display().to_string()),
+            "error message should contain the resolved repo root path: {error_msg}"
+        );
+        assert!(
+            error_msg.contains("src/commands.ts"),
+            "error message should mention missing commands.ts: {error_msg}"
+        );
+        assert!(
+            error_msg.contains("CLAUDE_CODE_UPSTREAM"),
+            "error message should explain how to supply the upstream path: {error_msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dump_manifests_uses_explicit_manifest_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "claw_test_explicit_manifest_dir_{}",
+            std::process::id()
+        ));
+        let workspace = root.join("workspace");
+        let upstream = root.join("upstream");
+        std::fs::create_dir_all(workspace.join("nested")).expect("workspace should exist");
+        std::fs::create_dir_all(upstream.join("src/entrypoints"))
+            .expect("upstream fixture should exist");
+        std::fs::write(
+            upstream.join("src/commands.ts"),
+            "import FooCommand from './commands/foo'\n",
+        )
+        .expect("commands fixture should write");
+        std::fs::write(
+            upstream.join("src/tools.ts"),
+            "import ReadTool from './tools/read'\n",
+        )
+        .expect("tools fixture should write");
+        std::fs::write(
+            upstream.join("src/entrypoints/cli.tsx"),
+            "startupProfiler()\n",
+        )
+        .expect("cli fixture should write");
+
+        let result = dump_manifests_at_path(&workspace, Some(&upstream), CliOutputFormat::Text);
+        assert!(
+            result.is_ok(),
+            "explicit manifest dir should succeed: {result:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

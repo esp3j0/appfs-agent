@@ -5537,6 +5537,24 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    fn env_guard_recovers_after_poisoning() {
+        let poisoned = std::thread::spawn(|| {
+            let _guard = env_guard();
+            panic!("poison env lock");
+        })
+        .join();
+        assert!(poisoned.is_err(), "poisoning thread should panic");
+
+        let _guard = env_guard();
+    }
+
     fn temp_path(name: &str) -> PathBuf {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
