@@ -298,6 +298,12 @@ mod tests {
                 cache_creation_input_tokens: 1,
                 cache_read_input_tokens: 0,
             }),
+            subtype: None,
+            compact_metadata: None,
+            attachment_metadata: None,
+            hook_result_metadata: None,
+            is_compact_summary: false,
+            is_visible_in_transcript_only: false,
         }];
 
         let tracker = UsageTracker::from_session(&session);
