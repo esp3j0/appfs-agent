@@ -37,6 +37,12 @@ use runtime::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::file_tools::{
+    edit_tool_result_text, parse_edit_tool_result, parse_read_tool_result, parse_write_tool_result,
+    prepare_edit, prepare_read, prepare_write, read_tool_result_text, record_edit_result,
+    record_read_result, record_write_result, write_tool_result_text,
+};
+
 /// Global task registry shared across tool invocations within a session.
 fn global_lsp_registry() -> &'static LspRegistry {
     use std::sync::OnceLock;
@@ -418,10 +424,14 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
+                    "file_path": { "type": "string" },
                     "offset": { "type": "integer", "minimum": 0 },
                     "limit": { "type": "integer", "minimum": 1 }
                 },
-                "required": ["path"],
+                "anyOf": [
+                    { "required": ["path"] },
+                    { "required": ["file_path"] }
+                ],
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::ReadOnly,
@@ -433,9 +443,13 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
+                    "file_path": { "type": "string" },
                     "content": { "type": "string" }
                 },
-                "required": ["path", "content"],
+                "anyOf": [
+                    { "required": ["path", "content"] },
+                    { "required": ["file_path", "content"] }
+                ],
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::WorkspaceWrite,
@@ -447,11 +461,15 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
+                    "file_path": { "type": "string" },
                     "old_string": { "type": "string" },
                     "new_string": { "type": "string" },
                     "replace_all": { "type": "boolean" }
                 },
-                "required": ["path", "old_string", "new_string"],
+                "anyOf": [
+                    { "required": ["path", "old_string", "new_string"] },
+                    { "required": ["file_path", "old_string", "new_string"] }
+                ],
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::WorkspaceWrite,
@@ -2059,25 +2077,47 @@ fn branch_divergence_stderr(
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_read_file(input: ReadFileInput) -> Result<String, String> {
-    to_pretty_json(read_file(&input.path, input.offset, input.limit).map_err(io_to_string)?)
+    let prepared = prepare_read(&input.path, input.offset, input.limit)?;
+    if let Some(dedup_output) = prepared.dedup_output {
+        return to_pretty_json(dedup_output);
+    }
+
+    let output = read_file(&input.path, input.offset, input.limit).map_err(io_to_string)?;
+    record_read_result(
+        &prepared.normalized_path,
+        &output,
+        prepared.requested_offset,
+        prepared.limit,
+    )?;
+    to_pretty_json(output)
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_write_file(input: WriteFileInput) -> Result<String, String> {
-    to_pretty_json(write_file(&input.path, &input.content).map_err(io_to_string)?)
+    let prepared = prepare_write(&input.path)?;
+    let output = write_file(&input.path, &input.content).map_err(io_to_string)?;
+    record_write_result(&prepared.normalized_path, &output)?;
+    to_pretty_json(output)
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_edit_file(input: EditFileInput) -> Result<String, String> {
-    to_pretty_json(
-        edit_file(
-            &input.path,
-            &input.old_string,
-            &input.new_string,
-            input.replace_all.unwrap_or(false),
-        )
-        .map_err(io_to_string)?,
+    let replace_all = input.replace_all.unwrap_or(false);
+    let prepared = prepare_edit(
+        &input.path,
+        &input.old_string,
+        &input.new_string,
+        replace_all,
+    )?;
+    let output = edit_file(
+        &input.path,
+        &prepared.actual_old_string,
+        &prepared.actual_new_string,
+        replace_all,
     )
+    .map_err(io_to_string)?;
+    record_edit_result(&prepared.normalized_path)?;
+    to_pretty_json(output)
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -2163,6 +2203,7 @@ fn io_to_string(error: std::io::Error) -> String {
 
 #[derive(Debug, Deserialize)]
 struct ReadFileInput {
+    #[serde(alias = "file_path")]
     path: String,
     offset: Option<usize>,
     limit: Option<usize>,
@@ -2170,12 +2211,14 @@ struct ReadFileInput {
 
 #[derive(Debug, Deserialize)]
 struct WriteFileInput {
+    #[serde(alias = "file_path")]
     path: String,
     content: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct EditFileInput {
+    #[serde(alias = "file_path")]
     path: String,
     old_string: String,
     new_string: String,
@@ -4226,6 +4269,28 @@ fn model_visible_tool_result_with_id(
     output: &str,
     is_error: bool,
 ) -> ModelVisibleToolResult {
+    if let Some((read_output, trailing_text)) = parse_read_tool_result_for_tool(tool_name, output) {
+        let mut result =
+            ModelVisibleToolResult::raw_text(&read_tool_result_text(&read_output), is_error);
+        append_trailing_tool_text(&mut result.content, trailing_text);
+        return result;
+    }
+
+    if let Some((write_output, trailing_text)) = parse_write_tool_result_for_tool(tool_name, output)
+    {
+        let mut result =
+            ModelVisibleToolResult::raw_text(&write_tool_result_text(&write_output), is_error);
+        append_trailing_tool_text(&mut result.content, trailing_text);
+        return result;
+    }
+
+    if let Some((edit_output, trailing_text)) = parse_edit_tool_result_for_tool(tool_name, output) {
+        let mut result =
+            ModelVisibleToolResult::raw_text(&edit_tool_result_text(&edit_output), is_error);
+        append_trailing_tool_text(&mut result.content, trailing_text);
+        return result;
+    }
+
     if let Some((shell_output, trailing_text)) = parse_shell_tool_result(tool_name, output) {
         let mut result = shell_tool_result_to_model_visible_result(&shell_output, is_error);
         append_trailing_tool_text(&mut result.content, trailing_text);
@@ -4382,7 +4447,7 @@ fn parse_search_tool_result_json(tool_name: &str, output: &str) -> Option<Search
     }
 }
 
-fn split_json_prefix(input: &str) -> Option<(&str, &str)> {
+pub(crate) fn split_json_prefix(input: &str) -> Option<(&str, &str)> {
     let start = input.find(|ch: char| !ch.is_whitespace())?;
     let mut stack = Vec::new();
     let mut in_string = false;
@@ -4431,6 +4496,36 @@ fn split_json_prefix(input: &str) -> Option<(&str, &str)> {
 
     let end = end?;
     Some((&input[start..end], &input[end..]))
+}
+
+fn parse_read_tool_result_for_tool<'a>(
+    tool_name: &str,
+    output: &'a str,
+) -> Option<(crate::file_tools::ReadToolOutput, &'a str)> {
+    match tool_name {
+        "read_file" | "Read" => parse_read_tool_result(output),
+        _ => None,
+    }
+}
+
+fn parse_write_tool_result_for_tool<'a>(
+    tool_name: &str,
+    output: &'a str,
+) -> Option<(runtime::WriteFileOutput, &'a str)> {
+    match tool_name {
+        "write_file" | "Write" => parse_write_tool_result(output),
+        _ => None,
+    }
+}
+
+fn parse_edit_tool_result_for_tool<'a>(
+    tool_name: &str,
+    output: &'a str,
+) -> Option<(runtime::EditFileOutput, &'a str)> {
+    match tool_name {
+        "edit_file" | "Edit" => parse_edit_tool_result(output),
+        _ => None,
+    }
 }
 
 fn shell_tool_result_to_model_visible_result(
@@ -6253,6 +6348,7 @@ fn parse_skill_description(contents: &str) -> Option<String> {
     None
 }
 
+mod file_tools;
 pub mod lane_completion;
 pub mod pdf_extract;
 
@@ -6621,6 +6717,101 @@ mod tests {
             ModelVisibleToolResult {
                 content: vec![ToolResultContentBlock::Text {
                     text: "No files found".to_string(),
+                }],
+                is_error: false,
+            }
+        );
+    }
+
+    #[test]
+    fn model_visible_tool_result_formats_read_results_like_ts() {
+        let output = serde_json::to_string_pretty(&json!({
+            "type": "text",
+            "file": {
+                "filePath": "C:\\repo\\demo.txt",
+                "content": "alpha\nbeta",
+                "numLines": 2,
+                "startLine": 7,
+                "totalLines": 20
+            }
+        }))
+        .expect("serialize read result");
+
+        let result = model_visible_tool_result("read_file", &output, false);
+
+        assert_eq!(
+            result,
+            ModelVisibleToolResult {
+                content: vec![ToolResultContentBlock::Text {
+                    text: "     7\talpha\n     8\tbeta".to_string(),
+                }],
+                is_error: false,
+            }
+        );
+    }
+
+    #[test]
+    fn model_visible_tool_result_formats_read_unchanged_stub_like_ts() {
+        let output = serde_json::to_string_pretty(&json!({
+            "type": "file_unchanged",
+            "file": {
+                "filePath": "C:\\repo\\demo.txt"
+            }
+        }))
+        .expect("serialize read unchanged result");
+
+        let result = model_visible_tool_result("read_file", &output, false);
+
+        assert_eq!(
+            result,
+            ModelVisibleToolResult {
+                content: vec![ToolResultContentBlock::Text {
+                    text: super::file_tools::FILE_UNCHANGED_STUB.to_string(),
+                }],
+                is_error: false,
+            }
+        );
+    }
+
+    #[test]
+    fn model_visible_tool_result_formats_write_and_edit_results_like_ts() {
+        let write_output = serde_json::to_string_pretty(&json!({
+            "type": "create",
+            "filePath": "C:\\repo\\demo.txt",
+            "content": "alpha",
+            "structuredPatch": [],
+            "originalFile": serde_json::Value::Null,
+            "gitDiff": serde_json::Value::Null
+        }))
+        .expect("serialize write result");
+        let write_result = model_visible_tool_result("write_file", &write_output, false);
+        assert_eq!(
+            write_result,
+            ModelVisibleToolResult {
+                content: vec![ToolResultContentBlock::Text {
+                    text: "File created successfully at: C:\\repo\\demo.txt".to_string(),
+                }],
+                is_error: false,
+            }
+        );
+
+        let edit_output = serde_json::to_string_pretty(&json!({
+            "filePath": "C:\\repo\\demo.txt",
+            "oldString": "alpha",
+            "newString": "omega",
+            "originalFile": "alpha\n",
+            "structuredPatch": [],
+            "userModified": false,
+            "replaceAll": true,
+            "gitDiff": serde_json::Value::Null
+        }))
+        .expect("serialize edit result");
+        let edit_result = model_visible_tool_result("edit_file", &edit_output, false);
+        assert_eq!(
+            edit_result,
+            ModelVisibleToolResult {
+                content: vec![ToolResultContentBlock::Text {
+                    text: "The file C:\\repo\\demo.txt has been updated. All occurrences were successfully replaced.".to_string(),
                 }],
                 is_error: false,
             }
@@ -9116,6 +9307,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn file_tools_cover_read_write_and_edit_behaviors() {
         let _guard = env_lock()
             .lock()
@@ -9124,6 +9316,10 @@ mod tests {
         fs::create_dir_all(&root).expect("create root");
         let demo_path = root.join("nested/demo.txt");
         let demo_path_string = demo_path.to_string_lossy().into_owned();
+        let existing_path = root.join("nested/existing.txt");
+        let existing_path_string = existing_path.to_string_lossy().into_owned();
+        let created_by_edit_path = root.join("nested/created-by-edit.txt");
+        let created_by_edit_path_string = created_by_edit_path.to_string_lossy().into_owned();
 
         let write_create = execute_tool(
             "write_file",
@@ -9151,14 +9347,21 @@ mod tests {
         assert_eq!(read_full_output["file"]["content"], "alpha\nbeta\ngamma");
         assert_eq!(read_full_output["file"]["startLine"], 1);
 
+        let read_full_again =
+            execute_tool("read_file", &json!({ "path": demo_path_string.as_str() }))
+                .expect("deduped read should succeed");
+        let read_full_again_output: serde_json::Value =
+            serde_json::from_str(&read_full_again).expect("json");
+        assert_eq!(read_full_again_output["type"], "file_unchanged");
+
         let read_slice = execute_tool(
             "read_file",
             &json!({ "path": demo_path_string.as_str(), "offset": 1, "limit": 1 }),
         )
         .expect("read slice should succeed");
         let read_slice_output: serde_json::Value = serde_json::from_str(&read_slice).expect("json");
-        assert_eq!(read_slice_output["file"]["content"], "beta");
-        assert_eq!(read_slice_output["file"]["startLine"], 2);
+        assert_eq!(read_slice_output["file"]["content"], "alpha");
+        assert_eq!(read_slice_output["file"]["startLine"], 1);
 
         let read_past_end = execute_tool(
             "read_file",
@@ -9168,12 +9371,46 @@ mod tests {
         let read_past_end_output: serde_json::Value =
             serde_json::from_str(&read_past_end).expect("json");
         assert_eq!(read_past_end_output["file"]["content"], "");
-        assert_eq!(read_past_end_output["file"]["startLine"], 4);
+        assert_eq!(read_past_end_output["file"]["startLine"], 50);
 
         let read_error = execute_tool("read_file", &json!({ "path": "missing.txt" }))
             .expect_err("missing file should fail");
         assert!(!read_error.is_empty());
 
+        fs::write(&existing_path, "before\n").expect("seed existing file");
+        let write_without_read = execute_tool(
+            "write_file",
+            &json!({ "path": existing_path_string.as_str(), "content": "after\n" }),
+        )
+        .expect_err("existing file write should require a prior read");
+        assert!(write_without_read.contains("Read it first before writing to it"));
+
+        execute_tool(
+            "read_file",
+            &json!({ "path": existing_path_string.as_str() }),
+        )
+        .expect("existing file read should succeed");
+        let write_after_read = execute_tool(
+            "write_file",
+            &json!({ "path": existing_path_string.as_str(), "content": "after\n" }),
+        )
+        .expect("existing file write after read should succeed");
+        let write_after_read_output: serde_json::Value =
+            serde_json::from_str(&write_after_read).expect("json");
+        assert_eq!(write_after_read_output["type"], "update");
+        assert_eq!(write_after_read_output["originalFile"], "before\n");
+
+        std::thread::sleep(Duration::from_millis(10));
+        fs::write(&existing_path, "user edit\n").expect("simulate external edit");
+        let stale_write = execute_tool(
+            "write_file",
+            &json!({ "path": existing_path_string.as_str(), "content": "stale\n" }),
+        )
+        .expect_err("stale write should fail");
+        assert!(stale_write.contains("modified since read"));
+
+        execute_tool("read_file", &json!({ "path": demo_path_string.as_str() }))
+            .expect("full read should refresh edit state");
         let edit_once = execute_tool(
             "edit_file",
             &json!({ "path": demo_path_string.as_str(), "old_string": "alpha", "new_string": "omega" }),
@@ -9191,6 +9428,17 @@ mod tests {
             &json!({ "path": demo_path_string.as_str(), "content": "alpha\nbeta\nalpha\n" }),
         )
         .expect("reset file");
+        let edit_ambiguous = execute_tool(
+            "edit_file",
+            &json!({
+                "path": demo_path_string.as_str(),
+                "old_string": "alpha",
+                "new_string": "omega"
+            }),
+        )
+        .expect_err("ambiguous edit should fail without replace_all");
+        assert!(edit_ambiguous.contains("replace_all is false"));
+
         let edit_all = execute_tool(
             "edit_file",
             &json!({
@@ -9213,14 +9461,28 @@ mod tests {
             &json!({ "path": demo_path_string.as_str(), "old_string": "omega", "new_string": "omega" }),
         )
         .expect_err("identical old/new should fail");
-        assert!(edit_same.contains("must differ"));
+        assert!(edit_same.contains("No changes to make"));
 
         let edit_missing = execute_tool(
             "edit_file",
             &json!({ "path": demo_path_string.as_str(), "old_string": "missing", "new_string": "omega" }),
         )
         .expect_err("missing substring should fail");
-        assert!(edit_missing.contains("old_string not found"));
+        assert!(edit_missing.contains("String to replace not found"));
+
+        execute_tool(
+            "edit_file",
+            &json!({
+                "path": created_by_edit_path_string.as_str(),
+                "old_string": "",
+                "new_string": "created by edit\n"
+            }),
+        )
+        .expect("edit should be able to create a new file");
+        assert_eq!(
+            fs::read_to_string(&created_by_edit_path).expect("read created-by-edit file"),
+            "created by edit\n"
+        );
 
         let _ = fs::remove_dir_all(root);
     }

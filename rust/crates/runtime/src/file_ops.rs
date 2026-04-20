@@ -193,19 +193,25 @@ pub fn read_file(
 
     let content = fs::read_to_string(&absolute_path)?;
     let lines: Vec<&str> = content.lines().collect();
-    let start_index = offset.unwrap_or(0).min(lines.len());
+    let requested_offset = offset.unwrap_or(1);
+    let start_index = if requested_offset == 0 {
+        0
+    } else {
+        requested_offset.saturating_sub(1)
+    };
+    let clamped_start_index = start_index.min(lines.len());
     let end_index = limit.map_or(lines.len(), |limit| {
-        start_index.saturating_add(limit).min(lines.len())
+        clamped_start_index.saturating_add(limit).min(lines.len())
     });
-    let selected = lines[start_index..end_index].join("\n");
+    let selected = lines[clamped_start_index..end_index].join("\n");
 
     Ok(ReadFileOutput {
         kind: String::from("text"),
         file: TextFilePayload {
             file_path: absolute_path.to_string_lossy().into_owned(),
             content: selected,
-            num_lines: end_index.saturating_sub(start_index),
-            start_line: start_index.saturating_add(1),
+            num_lines: end_index.saturating_sub(clamped_start_index),
+            start_line: requested_offset,
             total_lines: lines.len(),
         },
     })
@@ -250,15 +256,21 @@ pub fn edit_file(
     new_string: &str,
     replace_all: bool,
 ) -> io::Result<EditFileOutput> {
-    let absolute_path = normalize_path(path)?;
-    let original_file = fs::read_to_string(&absolute_path)?;
+    let absolute_path = normalize_path_allow_missing(path)?;
+    let original_file = fs::read_to_string(&absolute_path).or_else(|error| {
+        if error.kind() == io::ErrorKind::NotFound && old_string.is_empty() {
+            Ok(String::new())
+        } else {
+            Err(error)
+        }
+    })?;
     if old_string == new_string {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "old_string and new_string must differ",
         ));
     }
-    if !original_file.contains(old_string) {
+    if !old_string.is_empty() && !original_file.contains(old_string) {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             "old_string not found in file",
@@ -700,10 +712,10 @@ where
     F: FnOnce(&Path) -> io::Result<PathBuf>,
 {
     match canonicalize(&candidate) {
-        Ok(canonical) => Ok(canonical),
+        Ok(canonical) => Ok(clean_path_buf(canonical)),
         Err(error) => {
             if candidate.exists() {
-                Ok(candidate)
+                Ok(clean_path_buf(candidate))
             } else {
                 Err(error)
             }
@@ -719,19 +731,39 @@ fn normalize_path_allow_missing(path: &str) -> io::Result<PathBuf> {
     let candidate = absolute_candidate(path)?;
 
     if let Ok(canonical) = candidate.canonicalize() {
-        return Ok(canonical);
+        return Ok(clean_path_buf(canonical));
     }
 
     if let Some(parent) = candidate.parent() {
         let canonical_parent = parent
             .canonicalize()
-            .unwrap_or_else(|_| parent.to_path_buf());
+            .map_or_else(|_| clean_path_buf(parent.to_path_buf()), clean_path_buf);
         if let Some(name) = candidate.file_name() {
-            return Ok(canonical_parent.join(name));
+            return Ok(clean_path_buf(canonical_parent.join(name)));
         }
     }
 
-    Ok(candidate)
+    Ok(clean_path_buf(candidate))
+}
+
+pub fn resolve_tool_path(path: &str) -> io::Result<PathBuf> {
+    normalize_path(path)
+}
+
+pub fn resolve_tool_path_allow_missing(path: &str) -> io::Result<PathBuf> {
+    normalize_path_allow_missing(path)
+}
+
+fn clean_path_buf(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let text = path.to_string_lossy();
+        if let Some(stripped) = text.strip_prefix(r"\\?\") {
+            return PathBuf::from(stripped);
+        }
+    }
+
+    path
 }
 
 /// Read a file with workspace boundary enforcement.
@@ -745,7 +777,8 @@ pub fn read_file_in_workspace(
     let absolute_path = normalize_path(path)?;
     let canonical_root = workspace_root
         .canonicalize()
-        .unwrap_or_else(|_| workspace_root.to_path_buf());
+        .map(clean_path_buf)
+        .unwrap_or_else(|_| clean_path_buf(workspace_root.to_path_buf()));
     validate_workspace_boundary(&absolute_path, &canonical_root)?;
     read_file(path, offset, limit)
 }
@@ -760,7 +793,8 @@ pub fn write_file_in_workspace(
     let absolute_path = normalize_path_allow_missing(path)?;
     let canonical_root = workspace_root
         .canonicalize()
-        .unwrap_or_else(|_| workspace_root.to_path_buf());
+        .map(clean_path_buf)
+        .unwrap_or_else(|_| clean_path_buf(workspace_root.to_path_buf()));
     validate_workspace_boundary(&absolute_path, &canonical_root)?;
     write_file(path, content)
 }
@@ -777,7 +811,8 @@ pub fn edit_file_in_workspace(
     let absolute_path = normalize_path(path)?;
     let canonical_root = workspace_root
         .canonicalize()
-        .unwrap_or_else(|_| workspace_root.to_path_buf());
+        .map(clean_path_buf)
+        .unwrap_or_else(|_| clean_path_buf(workspace_root.to_path_buf()));
     validate_workspace_boundary(&absolute_path, &canonical_root)?;
     edit_file(path, old_string, new_string, replace_all)
 }
@@ -789,10 +824,11 @@ pub fn is_symlink_escape(path: &Path, workspace_root: &Path) -> io::Result<bool>
     if !metadata.is_symlink() {
         return Ok(false);
     }
-    let resolved = path.canonicalize()?;
+    let resolved = clean_path_buf(path.canonicalize()?);
     let canonical_root = workspace_root
         .canonicalize()
-        .unwrap_or_else(|_| workspace_root.to_path_buf());
+        .map(clean_path_buf)
+        .unwrap_or_else(|_| clean_path_buf(workspace_root.to_path_buf()));
     Ok(!resolved.starts_with(&canonical_root))
 }
 
@@ -823,7 +859,8 @@ mod tests {
 
         let read_output = read_file(path.to_string_lossy().as_ref(), Some(1), Some(1))
             .expect("read should succeed");
-        assert_eq!(read_output.file.content, "two");
+        assert_eq!(read_output.file.content, "one");
+        assert_eq!(read_output.file.start_line, 1);
     }
 
     #[test]
