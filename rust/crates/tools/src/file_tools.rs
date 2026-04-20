@@ -84,7 +84,16 @@ fn global_file_tool_states() -> &'static Mutex<GlobalStateMap> {
 
 fn file_tool_context_root() -> Result<PathBuf, String> {
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    Ok(tool_output_root(&cwd))
+    let session_root = tool_output_root(&cwd);
+    let default_root = cwd.join(".claw");
+    if session_root == default_root {
+        Ok(PathBuf::from(format!(
+            "thread-file-tool-state-{:?}",
+            std::thread::current().id()
+        )))
+    } else {
+        Ok(session_root)
+    }
 }
 
 fn with_context_state_map<R>(action: impl FnOnce(&mut ContextStateMap) -> R) -> Result<R, String> {
@@ -119,18 +128,12 @@ fn file_timestamp_ms(path: &Path) -> Result<u64, String> {
 
 fn has_stale_file_contents(path: &Path, state: &FileToolState) -> Result<bool, String> {
     let last_write_time = file_timestamp_ms(path)?;
-    if last_write_time <= state.timestamp_ms {
-        return Ok(false);
-    }
-
     if !state.is_partial_view {
         let current_content = fs::read_to_string(path).map_err(|error| error.to_string())?;
-        if current_content == state.content {
-            return Ok(false);
-        }
+        return Ok(current_content != state.content);
     }
 
-    Ok(true)
+    Ok(last_write_time != state.timestamp_ms)
 }
 
 fn store_read_state(
@@ -203,9 +206,16 @@ pub(crate) fn record_read_result(
     requested_offset: usize,
     limit: Option<usize>,
 ) -> Result<(), String> {
+    let is_full_view = limit.is_none() && matches!(requested_offset, 0 | 1);
+    let content = if is_full_view {
+        fs::read_to_string(path).map_err(|error| error.to_string())?
+    } else {
+        output.file.content.clone()
+    };
+
     store_read_state(
         path,
-        output.file.content.clone(),
+        content,
         requested_offset,
         limit,
         FileToolStateSource::Read,

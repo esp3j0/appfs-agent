@@ -775,10 +775,10 @@ pub fn read_file_in_workspace(
     workspace_root: &Path,
 ) -> io::Result<ReadFileOutput> {
     let absolute_path = normalize_path(path)?;
-    let canonical_root = workspace_root
-        .canonicalize()
-        .map(clean_path_buf)
-        .unwrap_or_else(|_| clean_path_buf(workspace_root.to_path_buf()));
+    let canonical_root = workspace_root.canonicalize().map_or_else(
+        |_| clean_path_buf(workspace_root.to_path_buf()),
+        clean_path_buf,
+    );
     validate_workspace_boundary(&absolute_path, &canonical_root)?;
     read_file(path, offset, limit)
 }
@@ -791,10 +791,10 @@ pub fn write_file_in_workspace(
     workspace_root: &Path,
 ) -> io::Result<WriteFileOutput> {
     let absolute_path = normalize_path_allow_missing(path)?;
-    let canonical_root = workspace_root
-        .canonicalize()
-        .map(clean_path_buf)
-        .unwrap_or_else(|_| clean_path_buf(workspace_root.to_path_buf()));
+    let canonical_root = workspace_root.canonicalize().map_or_else(
+        |_| clean_path_buf(workspace_root.to_path_buf()),
+        clean_path_buf,
+    );
     validate_workspace_boundary(&absolute_path, &canonical_root)?;
     write_file(path, content)
 }
@@ -809,10 +809,10 @@ pub fn edit_file_in_workspace(
     workspace_root: &Path,
 ) -> io::Result<EditFileOutput> {
     let absolute_path = normalize_path(path)?;
-    let canonical_root = workspace_root
-        .canonicalize()
-        .map(clean_path_buf)
-        .unwrap_or_else(|_| clean_path_buf(workspace_root.to_path_buf()));
+    let canonical_root = workspace_root.canonicalize().map_or_else(
+        |_| clean_path_buf(workspace_root.to_path_buf()),
+        clean_path_buf,
+    );
     validate_workspace_boundary(&absolute_path, &canonical_root)?;
     edit_file(path, old_string, new_string, replace_all)
 }
@@ -825,10 +825,10 @@ pub fn is_symlink_escape(path: &Path, workspace_root: &Path) -> io::Result<bool>
         return Ok(false);
     }
     let resolved = clean_path_buf(path.canonicalize()?);
-    let canonical_root = workspace_root
-        .canonicalize()
-        .map(clean_path_buf)
-        .unwrap_or_else(|_| clean_path_buf(workspace_root.to_path_buf()));
+    let canonical_root = workspace_root.canonicalize().map_or_else(
+        |_| clean_path_buf(workspace_root.to_path_buf()),
+        clean_path_buf,
+    );
     Ok(!resolved.starts_with(&canonical_root))
 }
 
