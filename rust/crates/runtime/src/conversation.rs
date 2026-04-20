@@ -1713,11 +1713,15 @@ mod tests {
             }
         }
 
+        if !windows_bash_smoke_ok() {
+            return;
+        }
+
         let requests = Rc::new(RefCell::new(Vec::new()));
         let feature_config = RuntimeFeatureConfig::default().with_hooks(
             RuntimeHookConfig::default()
-                .with_pre_compact(vec![r"printf 'preserve failing test output'".to_string()])
-                .with_post_compact(vec![r"printf 'post compact note'".to_string()]),
+                .with_pre_compact(vec![shell_snippet("printf 'preserve failing test output'")])
+                .with_post_compact(vec![shell_snippet("printf 'post compact note'")]),
         );
         let mut runtime = ConversationRuntime::new_with_features(
             Session::new(),

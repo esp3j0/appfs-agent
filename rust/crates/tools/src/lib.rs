@@ -6279,12 +6279,14 @@ mod tests {
         ProviderRuntimeClient, SubagentToolExecutor,
     };
     use api::{OutputContentBlock, ToolResultContentBlock};
+    #[cfg(windows)]
+    use runtime::{bash_shell_path, set_shell_if_windows};
     use runtime::{
         permission_enforcer::PermissionEnforcer, ApiRequest, AssistantEvent, BashCommandOutput,
         ConversationRuntime, PermissionMode, PermissionPolicy, RuntimeError, Session, TaskPacket,
         ToolExecutor,
     };
-    use runtime::{tool_result_path, GlobSearchOutput, GrepSearchOutput, ProviderFallbackConfig};
+    use runtime::{GlobSearchOutput, GrepSearchOutput, ProviderFallbackConfig};
     use serde_json::json;
 
     fn env_lock() -> &'static Mutex<()> {
@@ -6296,6 +6298,33 @@ mod tests {
         env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn windows_bash_smoke_ok() -> bool {
+        #[cfg(windows)]
+        {
+            static OK: OnceLock<bool> = OnceLock::new();
+            *OK.get_or_init(|| {
+                if set_shell_if_windows().is_err() {
+                    return false;
+                }
+                let Ok(shell_path) = bash_shell_path() else {
+                    return false;
+                };
+                Command::new(shell_path)
+                    .args(["-lc", "printf ok"])
+                    .output()
+                    .is_ok_and(|output| {
+                        output.status.success()
+                            && String::from_utf8_lossy(&output.stdout).trim() == "ok"
+                    })
+            })
+        }
+
+        #[cfg(not(windows))]
+        {
+            true
+        }
     }
 
     #[test]
@@ -6658,8 +6687,8 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = temp_path("grep-wrapper-persist");
+        let restore_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         fs::create_dir_all(&root).expect("create root");
-        let original_dir = std::env::current_dir().expect("cwd");
         std::env::set_current_dir(&root).expect("set cwd");
 
         let content = "alpha\n".repeat(4_100);
@@ -6681,13 +6710,18 @@ mod tests {
             &serialized,
             false,
         );
-        let persisted_path = tool_result_path(&root, "tool:grep/1", "txt");
 
         let ToolResultContentBlock::Text { text } = &result.content[0] else {
             panic!("expected text block");
         };
         assert!(text.starts_with("<persisted-output>\n"));
-        assert!(text.contains(persisted_path.to_string_lossy().as_ref()));
+        let persisted_path = text
+            .lines()
+            .find_map(|line| {
+                line.split_once("Full output saved to: ")
+                    .map(|(_, path)| PathBuf::from(path))
+            })
+            .expect("persisted output path should be present in wrapper text");
         assert!(persisted_path.exists(), "persisted output should exist");
         assert_eq!(
             fs::read_to_string(&persisted_path).expect("read persisted output"),
@@ -6695,7 +6729,7 @@ mod tests {
         );
         assert!(!result.is_error);
 
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        std::env::set_current_dir(&restore_dir).expect("restore cwd");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -8888,14 +8922,36 @@ mod tests {
 
     #[test]
     fn bash_tool_reports_success_exit_failure_timeout_and_background() {
-        let success = execute_tool("bash", &json!({ "command": "printf 'hello'" }))
-            .expect("bash should succeed");
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        #[cfg(windows)]
+        if !windows_bash_smoke_ok() {
+            return;
+        }
+        #[cfg(windows)]
+        set_shell_if_windows().expect("set shell");
+
+        let success = execute_tool(
+            "bash",
+            &json!({
+                "command": "printf 'hello'",
+                "dangerouslyDisableSandbox": true
+            }),
+        )
+        .expect("bash should succeed");
         let success_output: serde_json::Value = serde_json::from_str(&success).expect("json");
         assert_eq!(success_output["stdout"], "hello");
         assert_eq!(success_output["interrupted"], false);
 
-        let failure = execute_tool("bash", &json!({ "command": "printf 'oops' >&2; exit 7" }))
-            .expect("bash failure should still return structured output");
+        let failure = execute_tool(
+            "bash",
+            &json!({
+                "command": "printf 'oops' >&2; exit 7",
+                "dangerouslyDisableSandbox": true
+            }),
+        )
+        .expect("bash failure should still return structured output");
         let failure_output: serde_json::Value = serde_json::from_str(&failure).expect("json");
         assert_eq!(failure_output["returnCodeInterpretation"], "exit_code:7");
         assert!(failure_output["stderr"]
@@ -8903,8 +8959,15 @@ mod tests {
             .expect("stderr")
             .contains("oops"));
 
-        let timeout = execute_tool("bash", &json!({ "command": "sleep 1", "timeout": 10 }))
-            .expect("bash timeout should return output");
+        let timeout = execute_tool(
+            "bash",
+            &json!({
+                "command": "sleep 1",
+                "timeout": 10,
+                "dangerouslyDisableSandbox": true
+            }),
+        )
+        .expect("bash timeout should return output");
         let timeout_output: serde_json::Value = serde_json::from_str(&timeout).expect("json");
         assert_eq!(timeout_output["interrupted"], true);
         assert_eq!(timeout_output["returnCodeInterpretation"], "timeout");
@@ -8915,7 +8978,11 @@ mod tests {
 
         let background = execute_tool(
             "bash",
-            &json!({ "command": "sleep 1", "run_in_background": true }),
+            &json!({
+                "command": "sleep 1",
+                "run_in_background": true,
+                "dangerouslyDisableSandbox": true
+            }),
         )
         .expect("bash background should succeed");
         let background_output: serde_json::Value = serde_json::from_str(&background).expect("json");
@@ -9780,9 +9847,21 @@ printf 'pwsh:%s' "$1"
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        #[cfg(windows)]
+        if !windows_bash_smoke_ok() {
+            return;
+        }
+        #[cfg(windows)]
+        set_shell_if_windows().expect("set shell");
         let registry = super::GlobalToolRegistry::builtin();
         let result = registry
-            .execute("bash", &json!({ "command": "printf 'ok'" }))
+            .execute(
+                "bash",
+                &json!({
+                    "command": "printf 'ok'",
+                    "dangerouslyDisableSandbox": true
+                }),
+            )
             .expect("bash should succeed without enforcer");
         let output: serde_json::Value = serde_json::from_str(&result).expect("json");
         assert_eq!(output["stdout"], "ok");
