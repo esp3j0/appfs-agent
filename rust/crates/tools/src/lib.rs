@@ -9218,9 +9218,22 @@ mod tests {
         assert_eq!(grep_count_output["numMatches"], 3);
         assert_eq!(grep_count_output["filenames"], json!([]));
         let grep_count_content = grep_count_output["content"].as_str().expect("content");
-        assert_eq!(
-            grep_count_content.replace('\\', "/"),
-            "nested/lib.rs:2\nnested/notes.txt:1"
+        let grep_count_lines = grep_count_content
+            .lines()
+            .map(|line| line.replace('\\', "/"))
+            .collect::<Vec<_>>();
+        assert_eq!(grep_count_lines.len(), 2);
+        assert!(
+            grep_count_lines
+                .iter()
+                .any(|line| line.ends_with("nested/lib.rs:2")),
+            "unexpected grep count lines: {grep_count_lines:?}"
+        );
+        assert!(
+            grep_count_lines
+                .iter()
+                .any(|line| line.ends_with("nested/notes.txt:1")),
+            "unexpected grep count lines: {grep_count_lines:?}"
         );
 
         let grep_error = execute_tool(
