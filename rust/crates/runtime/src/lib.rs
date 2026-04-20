@@ -158,8 +158,10 @@ pub use sandbox::{
     SandboxRequest, SandboxStatus,
 };
 pub use session::{
-    ContentBlock, ConversationMessage, MessageRole, Session, SessionCompaction, SessionError,
-    SessionFork, SessionPromptEntry,
+    AttachmentKind, AttachmentMetadata, CompactBoundaryMetadata, CompactPreservedSegment,
+    CompactTrigger, ContentBlock, ConversationMessage, HookResultEvent, HookResultMetadata,
+    MessageRole, Session, SessionCompaction, SessionError, SessionFork, SessionPromptEntry,
+    SystemMessageSubtype,
 };
 pub use sse::{IncrementalSseParser, SseEvent};
 pub use stale_base::{

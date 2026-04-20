@@ -171,6 +171,12 @@ mod tests {
                     text: "Summary:\nEarlier context".to_string(),
                 }],
                 usage: None,
+                subtype: None,
+                compact_metadata: None,
+                attachment_metadata: None,
+                hook_result_metadata: None,
+                is_compact_summary: false,
+                is_visible_in_transcript_only: false,
             },
             ConversationMessage::user_text("Please inspect src/main.rs"),
             ConversationMessage::assistant(vec![
