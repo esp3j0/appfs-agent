@@ -8,11 +8,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::json::{JsonError, JsonValue};
 use crate::usage::TokenUsage;
+use getrandom::getrandom;
 
 const SESSION_VERSION: u32 = 1;
 const ROTATE_AFTER_BYTES: u64 = 256 * 1024;
 const MAX_ROTATED_FILES: usize = 3;
 static SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+static MESSAGE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 static LAST_TIMESTAMP_MS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +98,7 @@ pub struct HookResultMetadata {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConversationMessage {
+    pub uuid: String,
     pub role: MessageRole,
     pub blocks: Vec<ContentBlock>,
     pub usage: Option<TokenUsage>,
@@ -649,36 +652,62 @@ impl Default for Session {
 }
 
 impl ConversationMessage {
-    #[must_use]
-    pub fn system_text(text: impl Into<String>) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        role: MessageRole,
+        blocks: Vec<ContentBlock>,
+        usage: Option<TokenUsage>,
+        subtype: Option<SystemMessageSubtype>,
+        compact_metadata: Option<CompactBoundaryMetadata>,
+        attachment_metadata: Option<AttachmentMetadata>,
+        hook_result_metadata: Option<HookResultMetadata>,
+        is_compact_summary: bool,
+        is_visible_in_transcript_only: bool,
+    ) -> Self {
         Self {
-            role: MessageRole::System,
-            blocks: vec![ContentBlock::Text { text: text.into() }],
-            usage: None,
-            subtype: None,
-            compact_metadata: None,
-            attachment_metadata: None,
-            hook_result_metadata: None,
-            is_compact_summary: false,
-            is_visible_in_transcript_only: false,
+            uuid: generate_message_uuid(),
+            role,
+            blocks,
+            usage,
+            subtype,
+            compact_metadata,
+            attachment_metadata,
+            hook_result_metadata,
+            is_compact_summary,
+            is_visible_in_transcript_only,
         }
     }
 
     #[must_use]
+    pub fn system_text(text: impl Into<String>) -> Self {
+        Self::new(
+            MessageRole::System,
+            vec![ContentBlock::Text { text: text.into() }],
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+        )
+    }
+
+    #[must_use]
     pub fn compact_boundary(metadata: CompactBoundaryMetadata) -> Self {
-        Self {
-            role: MessageRole::System,
-            blocks: vec![ContentBlock::Text {
+        Self::new(
+            MessageRole::System,
+            vec![ContentBlock::Text {
                 text: "Conversation compacted".to_string(),
             }],
-            usage: None,
-            subtype: Some(SystemMessageSubtype::CompactBoundary),
-            compact_metadata: Some(metadata),
-            attachment_metadata: None,
-            hook_result_metadata: None,
-            is_compact_summary: false,
-            is_visible_in_transcript_only: false,
-        }
+            None,
+            Some(SystemMessageSubtype::CompactBoundary),
+            Some(metadata),
+            None,
+            None,
+            false,
+            false,
+        )
     }
 
     #[must_use]
@@ -717,17 +746,17 @@ impl ConversationMessage {
         is_compact_summary: bool,
         is_visible_in_transcript_only: bool,
     ) -> Self {
-        Self {
-            role: MessageRole::User,
-            blocks: vec![ContentBlock::Text { text: text.into() }],
-            usage: None,
-            subtype: None,
-            compact_metadata: None,
+        Self::new(
+            MessageRole::User,
+            vec![ContentBlock::Text { text: text.into() }],
+            None,
+            None,
+            None,
             attachment_metadata,
             hook_result_metadata,
             is_compact_summary,
             is_visible_in_transcript_only,
-        }
+        )
     }
 
     #[must_use]
@@ -740,32 +769,32 @@ impl ConversationMessage {
 
     #[must_use]
     pub fn assistant(blocks: Vec<ContentBlock>) -> Self {
-        Self {
-            role: MessageRole::Assistant,
+        Self::new(
+            MessageRole::Assistant,
             blocks,
-            usage: None,
-            subtype: None,
-            compact_metadata: None,
-            attachment_metadata: None,
-            hook_result_metadata: None,
-            is_compact_summary: false,
-            is_visible_in_transcript_only: false,
-        }
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+        )
     }
 
     #[must_use]
     pub fn assistant_with_usage(blocks: Vec<ContentBlock>, usage: Option<TokenUsage>) -> Self {
-        Self {
-            role: MessageRole::Assistant,
+        Self::new(
+            MessageRole::Assistant,
             blocks,
             usage,
-            subtype: None,
-            compact_metadata: None,
-            attachment_metadata: None,
-            hook_result_metadata: None,
-            is_compact_summary: false,
-            is_visible_in_transcript_only: false,
-        }
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+        )
     }
 
     #[must_use]
@@ -775,27 +804,28 @@ impl ConversationMessage {
         output: impl Into<String>,
         is_error: bool,
     ) -> Self {
-        Self {
-            role: MessageRole::Tool,
-            blocks: vec![ContentBlock::ToolResult {
+        Self::new(
+            MessageRole::Tool,
+            vec![ContentBlock::ToolResult {
                 tool_use_id: tool_use_id.into(),
                 tool_name: tool_name.into(),
                 output: output.into(),
                 is_error,
             }],
-            usage: None,
-            subtype: None,
-            compact_metadata: None,
-            attachment_metadata: None,
-            hook_result_metadata: None,
-            is_compact_summary: false,
-            is_visible_in_transcript_only: false,
-        }
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+        )
     }
 
     #[must_use]
     pub fn to_json(&self) -> JsonValue {
         let mut object = BTreeMap::new();
+        object.insert("uuid".to_string(), JsonValue::String(self.uuid.clone()));
         object.insert(
             "role".to_string(),
             JsonValue::String(
@@ -853,10 +883,25 @@ impl ConversationMessage {
         JsonValue::Object(object)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn from_json(value: &JsonValue) -> Result<Self, SessionError> {
         let object = value
             .as_object()
             .ok_or_else(|| SessionError::Format("message must be an object".to_string()))?;
+        let uuid = match object.get("uuid") {
+            Some(value) => {
+                let uuid = value.as_str().ok_or_else(|| {
+                    SessionError::Format("message uuid must be a string".to_string())
+                })?;
+                if uuid.trim().is_empty() {
+                    return Err(SessionError::Format(
+                        "message uuid cannot be empty".to_string(),
+                    ));
+                }
+                uuid.to_string()
+            }
+            None => generate_message_uuid(),
+        };
         let role = match object
             .get("role")
             .and_then(JsonValue::as_str)
@@ -935,6 +980,7 @@ impl ConversationMessage {
             ));
         }
         Ok(Self {
+            uuid,
             role,
             blocks,
             usage,
@@ -1540,6 +1586,38 @@ fn generate_session_id() -> String {
     format!("session-{millis}-{counter}")
 }
 
+fn generate_message_uuid() -> String {
+    let mut bytes = [0_u8; 16];
+    if getrandom(&mut bytes).is_err() {
+        let millis = current_time_millis();
+        let counter = MESSAGE_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+        bytes[..8].copy_from_slice(&millis.to_be_bytes());
+        bytes[8..].copy_from_slice(&counter.to_be_bytes());
+    }
+    // RFC 4122 variant + version 4 bits.
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15]
+    )
+}
+
 fn write_atomic(path: &Path, contents: &str) -> Result<(), SessionError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -1698,7 +1776,27 @@ mod tests {
                 ("version".to_string(), JsonValue::Number(1)),
                 (
                     "messages".to_string(),
-                    JsonValue::Array(vec![ConversationMessage::user_text("legacy").to_json()]),
+                    JsonValue::Array(vec![JsonValue::Object(
+                        [
+                            ("role".to_string(), JsonValue::String("user".to_string())),
+                            (
+                                "blocks".to_string(),
+                                JsonValue::Array(vec![JsonValue::Object(
+                                    [
+                                        ("type".to_string(), JsonValue::String("text".to_string())),
+                                        (
+                                            "text".to_string(),
+                                            JsonValue::String("legacy".to_string()),
+                                        ),
+                                    ]
+                                    .into_iter()
+                                    .collect(),
+                                )]),
+                            ),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    )]),
                 ),
             ]
             .into_iter()
@@ -1710,11 +1808,36 @@ mod tests {
         fs::remove_file(&path).expect("temp file should be removable");
 
         assert_eq!(restored.messages.len(), 1);
-        assert_eq!(
-            restored.messages[0],
-            ConversationMessage::user_text("legacy")
-        );
+        assert_eq!(restored.messages[0].role, MessageRole::User);
+        assert!(matches!(
+            restored.messages[0].blocks.as_slice(),
+            [ContentBlock::Text { text }] if text == "legacy"
+        ));
+        assert!(!restored.messages[0].uuid.is_empty());
         assert!(!restored.session_id.is_empty());
+    }
+
+    #[test]
+    fn loads_legacy_session_jsonl_without_message_uuids() {
+        let path = temp_session_path("legacy-jsonl");
+        let legacy = [
+            r#"{"type":"session_meta","version":1,"session_id":"legacy-jsonl","created_at_ms":1,"updated_at_ms":2}"#,
+            r#"{"type":"message","message":{"role":"user","blocks":[{"type":"text","text":"legacy jsonl"}]}}"#,
+        ]
+        .join("\n");
+        fs::write(&path, format!("{legacy}\n")).expect("legacy jsonl should write");
+
+        let restored = Session::load_from_path(&path).expect("legacy jsonl should load");
+        fs::remove_file(&path).expect("temp file should be removable");
+
+        assert_eq!(restored.messages.len(), 1);
+        assert_eq!(restored.messages[0].role, MessageRole::User);
+        assert!(matches!(
+            restored.messages[0].blocks.as_slice(),
+            [ContentBlock::Text { text }] if text == "legacy jsonl"
+        ));
+        assert!(!restored.messages[0].uuid.is_empty());
+        assert_eq!(restored.session_id, "legacy-jsonl");
     }
 
     #[test]
@@ -1737,7 +1860,12 @@ mod tests {
         fs::remove_file(&path).expect("temp file should be removable");
 
         assert_eq!(restored.messages.len(), 2);
-        assert_eq!(restored.messages[0], ConversationMessage::user_text("hi"));
+        assert_eq!(restored.messages[0].role, MessageRole::User);
+        assert!(matches!(
+            restored.messages[0].blocks.as_slice(),
+            [ContentBlock::Text { text }] if text == "hi"
+        ));
+        assert!(!restored.messages[0].uuid.is_empty());
     }
 
     #[test]
@@ -1771,9 +1899,9 @@ mod tests {
                 messages_summarized: Some(8),
                 pre_compact_discovered_tools: vec!["bash".to_string(), "read_file".to_string()],
                 preserved_segment: Some(CompactPreservedSegment {
-                    head: "source-message-8".to_string(),
-                    anchor: "summary-message".to_string(),
-                    tail: "source-message-11".to_string(),
+                    head: "message-head-uuid".to_string(),
+                    anchor: "summary-message-uuid".to_string(),
+                    tail: "message-tail-uuid".to_string(),
                 }),
             }),
             ConversationMessage::user_text("Summary:\ncarried work"),
@@ -1804,7 +1932,11 @@ mod tests {
                 segment.anchor.as_str(),
                 segment.tail.as_str()
             )),
-            Some(("source-message-8", "summary-message", "source-message-11"))
+            Some((
+                "message-head-uuid",
+                "summary-message-uuid",
+                "message-tail-uuid"
+            ))
         );
     }
 

@@ -159,25 +159,13 @@ fn estimate_text_tokens(text: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::analyze_context_usage;
-    use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
+    use crate::session::{ContentBlock, ConversationMessage, Session};
 
     #[test]
     fn analyzes_system_prompt_sections_and_message_categories() {
         let mut session = Session::new();
         session.messages = vec![
-            ConversationMessage {
-                role: MessageRole::System,
-                blocks: vec![ContentBlock::Text {
-                    text: "Summary:\nEarlier context".to_string(),
-                }],
-                usage: None,
-                subtype: None,
-                compact_metadata: None,
-                attachment_metadata: None,
-                hook_result_metadata: None,
-                is_compact_summary: false,
-                is_visible_in_transcript_only: false,
-            },
+            ConversationMessage::system_text("Summary:\nEarlier context"),
             ConversationMessage::user_text("Please inspect src/main.rs"),
             ConversationMessage::assistant(vec![
                 ContentBlock::Text {

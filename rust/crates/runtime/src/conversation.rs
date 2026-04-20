@@ -1565,6 +1565,7 @@ mod tests {
             result.compacted_session.messages[3].role,
             MessageRole::Assistant
         );
+        let summary_uuid = result.compacted_session.messages[1].uuid.clone();
         assert!(matches!(
             result.compacted_session.messages[0].compact_metadata.as_ref(),
             Some(metadata)
@@ -1572,7 +1573,7 @@ mod tests {
                     && metadata
                         .preserved_segment
                         .as_ref()
-                        .is_some_and(|segment| segment.anchor == "summary-message")
+                        .is_some_and(|segment| segment.anchor == summary_uuid)
         ));
         assert_eq!(
             result.compacted_session.session_id,

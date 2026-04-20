@@ -10012,22 +10012,12 @@ mod tests {
                     input: r#"{"command":"ls -la"}"#.to_string(),
                 },
             ]),
-            ConversationMessage {
-                role: MessageRole::Tool,
-                blocks: vec![ContentBlock::ToolResult {
-                    tool_use_id: "toolu_abcdefghijklmnop".to_string(),
-                    tool_name: "bash".to_string(),
-                    output: "total 8\ndrwxr-xr-x  2 user staff   64 Apr  7 12:00 .".to_string(),
-                    is_error: false,
-                }],
-                usage: None,
-                subtype: None,
-                compact_metadata: None,
-                attachment_metadata: None,
-                hook_result_metadata: None,
-                is_compact_summary: false,
-                is_visible_in_transcript_only: false,
-            },
+            ConversationMessage::tool_result(
+                "toolu_abcdefghijklmnop",
+                "bash",
+                "total 8\ndrwxr-xr-x  2 user staff   64 Apr  7 12:00 .",
+                false,
+            ),
         ];
 
         // when
@@ -10058,22 +10048,12 @@ mod tests {
         // given
         let mut session = Session::new();
         session.session_id = "errs".to_string();
-        session.messages = vec![ConversationMessage {
-            role: MessageRole::Tool,
-            blocks: vec![ContentBlock::ToolResult {
-                tool_use_id: "short".to_string(),
-                tool_name: "read_file".to_string(),
-                output: "   ".to_string(),
-                is_error: true,
-            }],
-            usage: None,
-            subtype: None,
-            compact_metadata: None,
-            attachment_metadata: None,
-            hook_result_metadata: None,
-            is_compact_summary: false,
-            is_visible_in_transcript_only: false,
-        }];
+        session.messages = vec![ConversationMessage::tool_result(
+            "short",
+            "read_file",
+            "   ",
+            true,
+        )];
 
         // when
         let markdown =
@@ -11652,22 +11632,7 @@ UU conflicted.rs",
                 name: "bash".to_string(),
                 input: "{\"command\":\"pwd\"}".to_string(),
             }]),
-            ConversationMessage {
-                role: MessageRole::Tool,
-                blocks: vec![ContentBlock::ToolResult {
-                    tool_use_id: "tool-1".to_string(),
-                    tool_name: "bash".to_string(),
-                    output: "ok".to_string(),
-                    is_error: false,
-                }],
-                usage: None,
-                subtype: None,
-                compact_metadata: None,
-                attachment_metadata: None,
-                hook_result_metadata: None,
-                is_compact_summary: false,
-                is_visible_in_transcript_only: false,
-            },
+            ConversationMessage::tool_result("tool-1", "bash", "ok", false),
         ];
 
         let converted = super::convert_messages(&messages);

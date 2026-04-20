@@ -354,24 +354,26 @@ fn build_compacted_messages(options: CompactedMessageOptions<'_>) -> Vec<Convers
                 recent_messages_preserved,
             ),
         )],
-        CompactionLayout::TsBoundaryAndSummary => vec![
-            build_ts_compact_boundary_message(
-                boundary_trigger.unwrap_or(CompactTrigger::Manual),
-                pre_tokens,
-                removed_message_count,
-                source_messages,
-                &preserved_messages,
-                preserved_segment_anchor,
-            ),
-            ConversationMessage::compact_summary_user_text(
+        CompactionLayout::TsBoundaryAndSummary => {
+            let summary_message = ConversationMessage::compact_summary_user_text(
                 get_compact_user_summary_message(
                     summary,
                     suppress_follow_up_questions,
                     recent_messages_preserved,
                 ),
                 !recent_messages_preserved,
-            ),
-        ],
+            );
+            let boundary_message = build_ts_compact_boundary_message(
+                boundary_trigger.unwrap_or(CompactTrigger::Manual),
+                pre_tokens,
+                removed_message_count,
+                source_messages,
+                &preserved_messages,
+                preserved_segment_anchor,
+                Some(summary_message.uuid.as_str()),
+            );
+            vec![boundary_message, summary_message]
+        }
     };
     compacted_messages.extend(preserved_messages);
     compacted_messages.extend(post_compact_context_messages);
@@ -386,6 +388,7 @@ fn build_ts_compact_boundary_message(
     source_messages: &[ConversationMessage],
     preserved_messages: &[ConversationMessage],
     preserved_segment_anchor: Option<PreservedSegmentAnchor>,
+    summary_message_uuid: Option<&str>,
 ) -> ConversationMessage {
     ConversationMessage::compact_boundary(CompactBoundaryMetadata {
         trigger,
@@ -394,33 +397,28 @@ fn build_ts_compact_boundary_message(
         messages_summarized: Some(removed_message_count),
         pre_compact_discovered_tools: collect_discovered_tools(source_messages),
         preserved_segment: build_preserved_segment_metadata(
-            source_messages.len(),
-            preserved_messages.len(),
+            preserved_messages,
             preserved_segment_anchor,
+            summary_message_uuid,
         ),
     })
 }
 
 fn build_preserved_segment_metadata(
-    source_message_count: usize,
-    preserved_message_count: usize,
+    preserved_messages: &[ConversationMessage],
     anchor: Option<PreservedSegmentAnchor>,
+    summary_message_uuid: Option<&str>,
 ) -> Option<CompactPreservedSegment> {
-    if preserved_message_count == 0 || preserved_message_count > source_message_count {
+    if preserved_messages.is_empty() {
         return None;
     }
-
-    let head_index = source_message_count - preserved_message_count;
-    let tail_index = source_message_count - 1;
+    let anchor_uuid = match anchor.unwrap_or(PreservedSegmentAnchor::LastSummaryMessage) {
+        PreservedSegmentAnchor::LastSummaryMessage => summary_message_uuid?,
+    };
     Some(CompactPreservedSegment {
-        // Rust sessions do not yet persist TS-style message UUID chains. We
-        // still record stable synthetic anchors here so suffix-preserving
-        // compaction metadata is available now and can be upgraded later.
-        head: format!("source-message-{head_index}"),
-        anchor: match anchor.unwrap_or(PreservedSegmentAnchor::LastSummaryMessage) {
-            PreservedSegmentAnchor::LastSummaryMessage => "summary-message".to_string(),
-        },
-        tail: format!("source-message-{tail_index}"),
+        head: preserved_messages.first()?.uuid.clone(),
+        anchor: anchor_uuid.to_string(),
+        tail: preserved_messages.last()?.uuid.clone(),
     })
 }
 
@@ -1335,19 +1333,9 @@ mod tests {
                 text: "two ".repeat(200),
             }]),
             ConversationMessage::tool_result("1", "bash", "ok ".repeat(200), false),
-            ConversationMessage {
-                role: MessageRole::Assistant,
-                blocks: vec![ContentBlock::Text {
-                    text: "recent".to_string(),
-                }],
-                usage: None,
-                subtype: None,
-                compact_metadata: None,
-                attachment_metadata: None,
-                hook_result_metadata: None,
-                is_compact_summary: false,
-                is_visible_in_transcript_only: false,
-            },
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "recent".to_string(),
+            }]),
         ];
 
         let result = compact_session(
@@ -1441,19 +1429,7 @@ mod tests {
         let summary = "<summary>Conversation summary:\n- Scope: earlier work preserved.\n- Key timeline:\n  - user: large preserved context\n</summary>";
         let mut session = Session::new();
         session.messages = vec![
-            ConversationMessage {
-                role: MessageRole::System,
-                blocks: vec![ContentBlock::Text {
-                    text: get_compact_continuation_message(summary, true, true),
-                }],
-                usage: None,
-                subtype: None,
-                compact_metadata: None,
-                attachment_metadata: None,
-                hook_result_metadata: None,
-                is_compact_summary: false,
-                is_visible_in_transcript_only: false,
-            },
+            ConversationMessage::system_text(get_compact_continuation_message(summary, true, true)),
             ConversationMessage::user_text("tiny"),
             ConversationMessage::assistant(vec![ContentBlock::Text {
                 text: "recent".to_string(),
@@ -1583,6 +1559,8 @@ mod tests {
             }]),
         ];
 
+        let expected_head_uuid = session.messages[2].uuid.clone();
+        let expected_tail_uuid = session.messages[3].uuid.clone();
         let preserved_messages = session.messages[2..].to_vec();
         let result = build_compaction_result(
             &session,
@@ -1600,13 +1578,14 @@ mod tests {
         );
 
         assert_eq!(result.compacted_session.messages.len(), 4);
+        let summary_uuid = result.compacted_session.messages[1].uuid.clone();
         assert!(matches!(
             result.compacted_session.messages[0].compact_metadata.as_ref(),
             Some(metadata)
                 if metadata.preserved_segment.as_ref().is_some_and(|segment|
-                    segment.head == "source-message-2"
-                        && segment.anchor == "summary-message"
-                        && segment.tail == "source-message-3"
+                    segment.head == expected_head_uuid
+                        && segment.anchor == summary_uuid
+                        && segment.tail == expected_tail_uuid
                 )
         ));
         assert!(matches!(
