@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -22,13 +24,15 @@ use runtime::{
     summary_compression::compress_summary_text,
     task_registry::TaskRegistry,
     team_cron_registry::{CronRegistry, TeamRegistry},
+    tool_result_path,
     worker_boot::{WorkerReadySnapshot, WorkerRegistry, WorkerTaskReceipt},
     write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, BashCommandOutput,
     BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage, ConversationRuntime,
-    GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneEventName,
-    LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole, OAuthConfig, PermissionMode,
-    PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeConfig, RuntimeError,
-    RuntimeProviderConfig, RuntimeProviderKind, Session, TaskPacket, ToolError, ToolExecutor,
+    GlobSearchOutput, GrepSearchInput, GrepSearchOutput, LaneCommitProvenance, LaneEvent,
+    LaneEventBlocker, LaneEventName, LaneEventStatus, LaneFailureClass, McpDegradedReport,
+    MessageRole, OAuthConfig, PermissionMode, PermissionPolicy, PromptCacheEvent,
+    ProviderFallbackConfig, RuntimeConfig, RuntimeError, RuntimeProviderConfig,
+    RuntimeProviderKind, Session, TaskPacket, ToolError, ToolExecutor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -483,7 +487,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "-n": { "type": "boolean" },
                     "-i": { "type": "boolean" },
                     "type": { "type": "string" },
-                    "head_limit": { "type": "integer", "minimum": 1 },
+                    "head_limit": { "type": "integer", "minimum": 0 },
                     "offset": { "type": "integer", "minimum": 0 },
                     "multiline": { "type": "boolean" }
                 },
@@ -2019,6 +2023,7 @@ fn powershell_branch_divergence_output(
             missing_fixes,
         ),
         interrupted: false,
+        raw_output_path: None,
         return_code_interpretation: Some("preflight_blocked:branch_divergence".to_string()),
         is_image: None,
         persisted_output_path: None,
@@ -2327,6 +2332,8 @@ struct PowerShellCommandOutput {
     stdout: String,
     stderr: String,
     interrupted: bool,
+    #[serde(rename = "rawOutputPath", skip_serializing_if = "Option::is_none")]
+    raw_output_path: Option<String>,
     #[serde(
         rename = "returnCodeInterpretation",
         skip_serializing_if = "Option::is_none"
@@ -4184,6 +4191,8 @@ const PERSISTED_OUTPUT_TAG: &str = "<persisted-output>";
 const PERSISTED_OUTPUT_CLOSING_TAG: &str = "</persisted-output>";
 const PERSISTED_OUTPUT_PREVIEW_BYTES: usize = 2_000;
 const INTERRUPTED_COMMAND_TAG: &str = "<error>Command was aborted before completion</error>";
+const GLOB_RESULT_PERSIST_THRESHOLD_CHARS: usize = 100_000;
+const GREP_RESULT_PERSIST_THRESHOLD_CHARS: usize = 20_000;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelVisibleToolResult {
@@ -4208,17 +4217,35 @@ pub fn model_visible_tool_result(
     output: &str,
     is_error: bool,
 ) -> ModelVisibleToolResult {
-    if !matches!(tool_name, "bash" | "PowerShell") {
-        return ModelVisibleToolResult::raw_text(output, is_error);
+    model_visible_tool_result_with_id(None, tool_name, output, is_error)
+}
+
+fn model_visible_tool_result_with_id(
+    tool_use_id: Option<&str>,
+    tool_name: &str,
+    output: &str,
+    is_error: bool,
+) -> ModelVisibleToolResult {
+    if let Some((shell_output, trailing_text)) = parse_shell_tool_result(tool_name, output) {
+        let mut result = shell_tool_result_to_model_visible_result(&shell_output, is_error);
+        append_trailing_tool_text(&mut result.content, trailing_text);
+        return result;
     }
 
-    let Some((shell_output, trailing_text)) = parse_shell_tool_result(tool_name, output) else {
-        return ModelVisibleToolResult::raw_text(output, is_error);
-    };
+    if let Some((search_output, trailing_text)) = parse_search_tool_result(tool_name, output) {
+        let mut result =
+            search_tool_result_to_model_visible_result(tool_use_id, &search_output, is_error);
+        append_trailing_tool_text(&mut result.content, trailing_text);
+        return result;
+    }
 
-    let mut result = shell_tool_result_to_model_visible_result(&shell_output, is_error);
-    append_trailing_tool_text(&mut result.content, trailing_text);
-    result
+    ModelVisibleToolResult::raw_text(output, is_error)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SearchToolResult {
+    text: String,
+    persistence_threshold_chars: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -4260,10 +4287,12 @@ impl From<BashCommandOutput> for NormalizedShellToolResult {
 
 impl From<PowerShellCommandOutput> for NormalizedShellToolResult {
     fn from(value: PowerShellCommandOutput) -> Self {
-        let background_output_path = value
-            .background_task_id
-            .as_deref()
-            .and_then(derive_background_output_path);
+        let background_output_path = value.raw_output_path.clone().or_else(|| {
+            value
+                .background_task_id
+                .as_deref()
+                .and_then(derive_background_output_path)
+        });
         Self {
             stdout: value.stdout,
             stderr: value.stderr,
@@ -4280,6 +4309,8 @@ impl From<PowerShellCommandOutput> for NormalizedShellToolResult {
 }
 
 fn derive_background_output_path(task_id: &str) -> Option<String> {
+    // Older transcripts may only persist backgroundTaskId, so keep a
+    // session-aware fallback for replay/resume when rawOutputPath is absent.
     let cwd = std::env::current_dir().ok()?;
     Some(
         shell_task_output_path(&cwd, task_id)
@@ -4312,6 +4343,41 @@ fn parse_shell_tool_result_json(
         "PowerShell" => serde_json::from_str::<PowerShellCommandOutput>(output)
             .ok()
             .map(NormalizedShellToolResult::from),
+        _ => None,
+    }
+}
+
+fn parse_search_tool_result<'a>(
+    tool_name: &str,
+    output: &'a str,
+) -> Option<(SearchToolResult, &'a str)> {
+    if let Some(parsed) = parse_search_tool_result_json(tool_name, output) {
+        return Some((parsed, ""));
+    }
+
+    let (json_prefix, trailing_text) = split_json_prefix(output)?;
+    let parsed = parse_search_tool_result_json(tool_name, json_prefix)?;
+    Some((parsed, trailing_text))
+}
+
+fn parse_search_tool_result_json(tool_name: &str, output: &str) -> Option<SearchToolResult> {
+    match tool_name {
+        "glob_search" | "Glob" => {
+            serde_json::from_str::<GlobSearchOutput>(output)
+                .ok()
+                .map(|result| SearchToolResult {
+                    text: glob_tool_result_text(&result),
+                    persistence_threshold_chars: GLOB_RESULT_PERSIST_THRESHOLD_CHARS,
+                })
+        }
+        "grep_search" | "Grep" => {
+            serde_json::from_str::<GrepSearchOutput>(output)
+                .ok()
+                .map(|result| SearchToolResult {
+                    text: grep_tool_result_text(&result),
+                    persistence_threshold_chars: GREP_RESULT_PERSIST_THRESHOLD_CHARS,
+                })
+        }
         _ => None,
     }
 }
@@ -4424,6 +4490,136 @@ fn shell_tool_result_to_model_visible_result(
     }
 }
 
+fn search_tool_result_to_model_visible_result(
+    tool_use_id: Option<&str>,
+    output: &SearchToolResult,
+    is_error: bool,
+) -> ModelVisibleToolResult {
+    let mut text = output.text.clone();
+    if text.chars().count() > output.persistence_threshold_chars {
+        if let Some(tool_use_id) = tool_use_id {
+            if let Ok(persisted) = persist_model_visible_tool_text(tool_use_id, &text) {
+                let (preview, has_more) =
+                    generate_tool_result_preview(&text, PERSISTED_OUTPUT_PREVIEW_BYTES);
+                text = build_large_tool_result_message(
+                    &persisted.path,
+                    persisted.original_size,
+                    &preview,
+                    has_more,
+                );
+            }
+        }
+    }
+
+    ModelVisibleToolResult {
+        content: vec![ToolResultContentBlock::Text { text }],
+        is_error,
+    }
+}
+
+fn glob_tool_result_text(output: &GlobSearchOutput) -> String {
+    if output.num_files == 0 {
+        return String::from("No files found");
+    }
+
+    let mut lines = output.filenames.clone();
+    if output.truncated {
+        lines.push(String::from(
+            "(Results are truncated. Consider using a more specific path or pattern.)",
+        ));
+    }
+    lines.join("\n")
+}
+
+fn grep_tool_result_text(output: &GrepSearchOutput) -> String {
+    let mode = output.mode.as_deref().unwrap_or("files_with_matches");
+    let limit_info = format_search_limit_info(output.applied_limit, output.applied_offset);
+
+    match mode {
+        "content" => {
+            let mut result = output
+                .content
+                .clone()
+                .unwrap_or_else(|| String::from("No matches found"));
+            if !limit_info.is_empty() {
+                result.push_str("\n\n[Showing results with pagination = ");
+                result.push_str(&limit_info);
+                result.push(']');
+            }
+            result
+        }
+        "count" => {
+            let raw_content = output
+                .content
+                .clone()
+                .unwrap_or_else(|| String::from("No matches found"));
+            let matches = output.num_matches.unwrap_or(0);
+            let files = output.num_files;
+            let summary = if limit_info.is_empty() {
+                format!(
+                    "\n\nFound {matches} total {} across {files} {}.",
+                    if matches == 1 {
+                        "occurrence"
+                    } else {
+                        "occurrences"
+                    },
+                    if files == 1 { "file" } else { "files" }
+                )
+            } else {
+                format!(
+                    "\n\nFound {matches} total {} across {files} {}. with pagination = {limit_info}",
+                    if matches == 1 {
+                        "occurrence"
+                    } else {
+                        "occurrences"
+                    },
+                    if files == 1 { "file" } else { "files" }
+                )
+            };
+            format!("{raw_content}{summary}")
+        }
+        _ => {
+            if output.num_files == 0 {
+                return String::from("No files found");
+            }
+
+            let header = if limit_info.is_empty() {
+                format!(
+                    "Found {} {}",
+                    output.num_files,
+                    if output.num_files == 1 {
+                        "file"
+                    } else {
+                        "files"
+                    }
+                )
+            } else {
+                format!(
+                    "Found {} {} {limit_info}",
+                    output.num_files,
+                    if output.num_files == 1 {
+                        "file"
+                    } else {
+                        "files"
+                    }
+                )
+            };
+            format!("{header}\n{}", output.filenames.join("\n"))
+        }
+    }
+}
+
+fn format_search_limit_info(applied_limit: Option<usize>, applied_offset: Option<usize>) -> String {
+    let mut parts = Vec::new();
+    if let Some(limit) = applied_limit {
+        parts.push(format!("limit: {limit}"));
+    }
+    if let Some(offset) = applied_offset {
+        parts.push(format!("offset: {offset}"));
+    }
+    parts.join(", ")
+}
+
 fn tool_result_content_block_from_value(value: &Value) -> ToolResultContentBlock {
     match value {
         Value::String(text) => ToolResultContentBlock::Text { text: text.clone() },
@@ -4491,6 +4687,34 @@ fn build_large_tool_result_message(
     }
     message.push_str(PERSISTED_OUTPUT_CLOSING_TAG);
     message
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PersistedModelVisibleToolText {
+    path: String,
+    original_size: u64,
+}
+
+fn persist_model_visible_tool_text(
+    tool_use_id: &str,
+    content: &str,
+) -> std::io::Result<PersistedModelVisibleToolText> {
+    let cwd = std::env::current_dir()?;
+    let path = tool_result_path(&cwd, tool_use_id, "txt");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    match OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(mut file) => file.write_all(content.as_bytes())?,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+
+    Ok(PersistedModelVisibleToolText {
+        path: path.to_string_lossy().into_owned(),
+        original_size: u64::try_from(content.len()).expect("content length fits u64"),
+    })
 }
 
 fn format_file_size(size_in_bytes: u64) -> String {
@@ -4607,7 +4831,12 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                         is_error,
                         ..
                     } => {
-                        let result = model_visible_tool_result(tool_name, output, *is_error);
+                        let result = model_visible_tool_result_with_id(
+                            Some(tool_use_id),
+                            tool_name,
+                            output,
+                            *is_error,
+                        );
                         InputContentBlock::ToolResult {
                             tool_use_id: tool_use_id.clone(),
                             content: result.content,
@@ -5853,6 +6082,7 @@ fn execute_shell_command(
             stdout: String::new(),
             stderr: String::new(),
             interrupted: false,
+            raw_output_path: Some(background_output.output_path),
             is_image: None,
             background_task_id: Some(background_output.task_id),
             backgrounded_by_user: None,
@@ -5891,6 +6121,7 @@ fn execute_shell_command(
                     stdout: prepared_output.stdout,
                     stderr: prepared_output.stderr,
                     interrupted: false,
+                    raw_output_path: None,
                     is_image: None,
                     background_task_id: None,
                     backgrounded_by_user: None,
@@ -5927,6 +6158,7 @@ Command exceeded timeout of {timeout_ms} ms",
                     stdout: prepared_output.stdout,
                     stderr: prepared_output.stderr,
                     interrupted: true,
+                    raw_output_path: None,
                     is_image: None,
                     background_task_id: None,
                     backgrounded_by_user: None,
@@ -5948,6 +6180,7 @@ Command exceeded timeout of {timeout_ms} ms",
         stdout: prepared_output.stdout,
         stderr: prepared_output.stderr,
         interrupted: false,
+        raw_output_path: None,
         is_image: None,
         background_task_id: None,
         backgrounded_by_user: None,
@@ -6039,19 +6272,21 @@ mod tests {
     use super::{
         agent_permission_policy, allowed_tools_for_subagent, classify_lane_failure,
         derive_agent_state, execute_agent_with_spawn, execute_tool, final_assistant_text,
-        maybe_commit_provenance, model_visible_tool_result, mvp_tool_specs,
-        permission_mode_from_plugin, persist_agent_terminal_state, push_output_block,
-        run_task_packet, AgentInput, AgentJob, GlobalToolRegistry, LaneEventName, LaneFailureClass,
-        ModelVisibleToolResult, PowerShellCommandOutput, ProviderRuntimeClient,
-        SubagentToolExecutor,
+        maybe_commit_provenance, model_visible_tool_result, model_visible_tool_result_with_id,
+        mvp_tool_specs, permission_mode_from_plugin, persist_agent_terminal_state,
+        push_output_block, run_task_packet, AgentInput, AgentJob, GlobalToolRegistry,
+        LaneEventName, LaneFailureClass, ModelVisibleToolResult, PowerShellCommandOutput,
+        ProviderRuntimeClient, SubagentToolExecutor,
     };
     use api::{OutputContentBlock, ToolResultContentBlock};
-    use runtime::ProviderFallbackConfig;
+    #[cfg(windows)]
+    use runtime::{bash_shell_path, set_shell_if_windows};
     use runtime::{
         permission_enforcer::PermissionEnforcer, ApiRequest, AssistantEvent, BashCommandOutput,
         ConversationRuntime, PermissionMode, PermissionPolicy, RuntimeError, Session, TaskPacket,
         ToolExecutor,
     };
+    use runtime::{GlobSearchOutput, GrepSearchOutput, ProviderFallbackConfig};
     use serde_json::json;
 
     fn env_lock() -> &'static Mutex<()> {
@@ -6063,6 +6298,33 @@ mod tests {
         env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn windows_bash_smoke_ok() -> bool {
+        #[cfg(windows)]
+        {
+            static OK: OnceLock<bool> = OnceLock::new();
+            *OK.get_or_init(|| {
+                if set_shell_if_windows().is_err() {
+                    return false;
+                }
+                let Ok(shell_path) = bash_shell_path() else {
+                    return false;
+                };
+                Command::new(shell_path)
+                    .args(["-lc", "printf ok"])
+                    .output()
+                    .is_ok_and(|output| {
+                        output.status.success()
+                            && String::from_utf8_lossy(&output.stdout).trim() == "ok"
+                    })
+            })
+        }
+
+        #[cfg(not(windows))]
+        {
+            true
+        }
     }
 
     #[test]
@@ -6107,6 +6369,7 @@ mod tests {
             stdout: stdout.to_string(),
             stderr: stderr.to_string(),
             interrupted,
+            raw_output_path: None,
             return_code_interpretation: None,
             is_image: None,
             persisted_output_path: None,
@@ -6123,6 +6386,14 @@ mod tests {
         tool_name: &str,
     ) -> ModelVisibleToolResult {
         let serialized = serde_json::to_string_pretty(output).expect("serialize shell output");
+        model_visible_tool_result(tool_name, &serialized, false)
+    }
+
+    fn search_model_result<T: serde::Serialize>(
+        output: &T,
+        tool_name: &str,
+    ) -> ModelVisibleToolResult {
+        let serialized = serde_json::to_string_pretty(output).expect("serialize search output");
         model_visible_tool_result(tool_name, &serialized, false)
     }
 
@@ -6255,22 +6526,30 @@ mod tests {
     }
 
     #[test]
-    fn model_visible_tool_result_derives_powershell_background_output_path_from_task_id() {
+    fn model_visible_tool_result_uses_powershell_raw_output_path_when_present() {
         let mut output = powershell_output("", "", false);
         output.background_task_id = Some("b1234xyz".to_string());
+        output.raw_output_path = Some(
+            "C:\\repo\\.claw\\sessions\\8f86a4368751b5ad\\session-1776656373469-0\\tasks\\b1234xyz.output"
+                .to_string(),
+        );
 
         let result = shell_model_result(&output, "PowerShell");
-        let expected_path = super::derive_background_output_path("b1234xyz")
-            .expect("background output path should resolve");
 
         let ToolResultContentBlock::Text { text } = &result.content[0] else {
             panic!("expected text block");
         };
-        assert_eq!(
-            text.as_str(),
-            format!(
-                "Command running in background with ID: b1234xyz. Output is being written to: {expected_path}"
-            )
+        assert!(
+            text.starts_with(
+                "Command running in background with ID: b1234xyz. Output is being written to: "
+            ),
+            "unexpected background message: {text}"
+        );
+        assert!(
+            text.ends_with(
+                "C:\\repo\\.claw\\sessions\\8f86a4368751b5ad\\session-1776656373469-0\\tasks\\b1234xyz.output"
+            ),
+            "unexpected background message: {text}"
         );
         assert!(!result.is_error);
     }
@@ -6280,10 +6559,12 @@ mod tests {
         let mut output = powershell_output("", "", false);
         output.background_task_id = Some("babc1234".to_string());
         output.assistant_auto_backgrounded = Some(true);
+        output.raw_output_path = Some(
+            "C:\\repo\\.claw\\sessions\\8f86a4368751b5ad\\session-1776656373469-0\\tasks\\babc1234.output"
+                .to_string(),
+        );
 
         let result = shell_model_result(&output, "PowerShell");
-        let expected_path = super::derive_background_output_path("babc1234")
-            .expect("background output path should resolve");
 
         let ToolResultContentBlock::Text { text } = &result.content[0] else {
             panic!("expected text block");
@@ -6292,10 +6573,164 @@ mod tests {
             "Command exceeded the assistant-mode blocking budget (15s) and was moved to the background with ID: babc1234."
         ));
         assert!(text.contains("It is still running - you will be notified when it completes."));
-        assert!(text.contains(&format!("Output is being written to: {expected_path}.")));
+        assert!(text.contains(
+            "Output is being written to: C:\\repo\\.claw\\sessions\\8f86a4368751b5ad\\session-1776656373469-0\\tasks\\babc1234.output."
+        ));
         assert!(text.contains(
             "In assistant mode, delegate long-running work to a subagent or use run_in_background to keep this conversation responsive."
         ));
+    }
+
+    #[test]
+    fn model_visible_tool_result_formats_glob_results_like_ts() {
+        let result = search_model_result(
+            &GlobSearchOutput {
+                duration_ms: 5,
+                num_files: 2,
+                filenames: vec!["src/lib.rs".to_string(), "src/main.rs".to_string()],
+                truncated: false,
+            },
+            "glob_search",
+        );
+
+        assert_eq!(
+            result,
+            ModelVisibleToolResult {
+                content: vec![ToolResultContentBlock::Text {
+                    text: "src/lib.rs\nsrc/main.rs".to_string(),
+                }],
+                is_error: false,
+            }
+        );
+    }
+
+    #[test]
+    fn model_visible_tool_result_formats_empty_glob_results_like_ts() {
+        let result = search_model_result(
+            &GlobSearchOutput {
+                duration_ms: 3,
+                num_files: 0,
+                filenames: Vec::new(),
+                truncated: false,
+            },
+            "glob_search",
+        );
+
+        assert_eq!(
+            result,
+            ModelVisibleToolResult {
+                content: vec![ToolResultContentBlock::Text {
+                    text: "No files found".to_string(),
+                }],
+                is_error: false,
+            }
+        );
+    }
+
+    #[test]
+    fn model_visible_tool_result_formats_grep_count_results_like_ts() {
+        let result = search_model_result(
+            &GrepSearchOutput {
+                mode: Some("count".to_string()),
+                num_files: 2,
+                filenames: Vec::new(),
+                num_lines: None,
+                content: Some("src/lib.rs:2\nsrc/main.rs:1".to_string()),
+                num_matches: Some(3),
+                applied_limit: Some(10),
+                applied_offset: Some(5),
+            },
+            "grep_search",
+        );
+
+        assert_eq!(
+            result,
+            ModelVisibleToolResult {
+                content: vec![ToolResultContentBlock::Text {
+                    text: "src/lib.rs:2\nsrc/main.rs:1\n\nFound 3 total occurrences across 2 files. with pagination = limit: 10, offset: 5".to_string(),
+                }],
+                is_error: false,
+            }
+        );
+    }
+
+    #[test]
+    fn model_visible_tool_result_formats_grep_files_with_matches_like_ts() {
+        let result = search_model_result(
+            &GrepSearchOutput {
+                mode: Some("files_with_matches".to_string()),
+                num_files: 2,
+                filenames: vec!["src/lib.rs".to_string(), "src/main.rs".to_string()],
+                num_lines: None,
+                content: None,
+                num_matches: None,
+                applied_limit: Some(25),
+                applied_offset: Some(3),
+            },
+            "grep_search",
+        );
+
+        assert_eq!(
+            result,
+            ModelVisibleToolResult {
+                content: vec![ToolResultContentBlock::Text {
+                    text: "Found 2 files limit: 25, offset: 3\nsrc/lib.rs\nsrc/main.rs".to_string(),
+                }],
+                is_error: false,
+            }
+        );
+    }
+
+    #[test]
+    fn model_visible_tool_result_persists_large_grep_results_for_tool_use_id() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("grep-wrapper-persist");
+        let restore_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        fs::create_dir_all(&root).expect("create root");
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let content = "alpha\n".repeat(4_100);
+        let serialized = serde_json::to_string_pretty(&GrepSearchOutput {
+            mode: Some("content".to_string()),
+            num_files: 0,
+            filenames: Vec::new(),
+            num_lines: Some(4_100),
+            content: Some(content.clone()),
+            num_matches: None,
+            applied_limit: None,
+            applied_offset: None,
+        })
+        .expect("serialize grep output");
+
+        let result = model_visible_tool_result_with_id(
+            Some("tool:grep/1"),
+            "grep_search",
+            &serialized,
+            false,
+        );
+
+        let ToolResultContentBlock::Text { text } = &result.content[0] else {
+            panic!("expected text block");
+        };
+        assert!(text.starts_with("<persisted-output>\n"));
+        let persisted_path = text
+            .lines()
+            .find_map(|line| {
+                line.split_once("Full output saved to: ")
+                    .map(|(_, path)| PathBuf::from(path))
+            })
+            .expect("persisted output path should be present in wrapper text");
+        assert!(persisted_path.exists(), "persisted output should exist");
+        assert_eq!(
+            fs::read_to_string(&persisted_path).expect("read persisted output"),
+            content
+        );
+        assert!(!result.is_error);
+
+        std::env::set_current_dir(&restore_dir).expect("restore cwd");
+        let _ = fs::remove_dir_all(root);
     }
 
     fn temp_path(name: &str) -> PathBuf {
@@ -8487,14 +8922,36 @@ mod tests {
 
     #[test]
     fn bash_tool_reports_success_exit_failure_timeout_and_background() {
-        let success = execute_tool("bash", &json!({ "command": "printf 'hello'" }))
-            .expect("bash should succeed");
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        #[cfg(windows)]
+        if !windows_bash_smoke_ok() {
+            return;
+        }
+        #[cfg(windows)]
+        set_shell_if_windows().expect("set shell");
+
+        let success = execute_tool(
+            "bash",
+            &json!({
+                "command": "printf 'hello'",
+                "dangerouslyDisableSandbox": true
+            }),
+        )
+        .expect("bash should succeed");
         let success_output: serde_json::Value = serde_json::from_str(&success).expect("json");
         assert_eq!(success_output["stdout"], "hello");
         assert_eq!(success_output["interrupted"], false);
 
-        let failure = execute_tool("bash", &json!({ "command": "printf 'oops' >&2; exit 7" }))
-            .expect("bash failure should still return structured output");
+        let failure = execute_tool(
+            "bash",
+            &json!({
+                "command": "printf 'oops' >&2; exit 7",
+                "dangerouslyDisableSandbox": true
+            }),
+        )
+        .expect("bash failure should still return structured output");
         let failure_output: serde_json::Value = serde_json::from_str(&failure).expect("json");
         assert_eq!(failure_output["returnCodeInterpretation"], "exit_code:7");
         assert!(failure_output["stderr"]
@@ -8502,8 +8959,15 @@ mod tests {
             .expect("stderr")
             .contains("oops"));
 
-        let timeout = execute_tool("bash", &json!({ "command": "sleep 1", "timeout": 10 }))
-            .expect("bash timeout should return output");
+        let timeout = execute_tool(
+            "bash",
+            &json!({
+                "command": "sleep 1",
+                "timeout": 10,
+                "dangerouslyDisableSandbox": true
+            }),
+        )
+        .expect("bash timeout should return output");
         let timeout_output: serde_json::Value = serde_json::from_str(&timeout).expect("json");
         assert_eq!(timeout_output["interrupted"], true);
         assert_eq!(timeout_output["returnCodeInterpretation"], "timeout");
@@ -8514,7 +8978,11 @@ mod tests {
 
         let background = execute_tool(
             "bash",
-            &json!({ "command": "sleep 1", "run_in_background": true }),
+            &json!({
+                "command": "sleep 1",
+                "run_in_background": true,
+                "dangerouslyDisableSandbox": true
+            }),
         )
         .expect("bash background should succeed");
         let background_output: serde_json::Value = serde_json::from_str(&background).expect("json");
@@ -8654,22 +9122,22 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = temp_path("fs-suite");
         fs::create_dir_all(&root).expect("create root");
-        let original_dir = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&root).expect("set cwd");
+        let demo_path = root.join("nested/demo.txt");
+        let demo_path_string = demo_path.to_string_lossy().into_owned();
 
         let write_create = execute_tool(
             "write_file",
-            &json!({ "path": "nested/demo.txt", "content": "alpha\nbeta\nalpha\n" }),
+            &json!({ "path": demo_path_string.as_str(), "content": "alpha\nbeta\nalpha\n" }),
         )
         .expect("write create should succeed");
         let write_create_output: serde_json::Value =
             serde_json::from_str(&write_create).expect("json");
         assert_eq!(write_create_output["type"], "create");
-        assert!(root.join("nested/demo.txt").exists());
+        assert!(demo_path.exists());
 
         let write_update = execute_tool(
             "write_file",
-            &json!({ "path": "nested/demo.txt", "content": "alpha\nbeta\ngamma\n" }),
+            &json!({ "path": demo_path_string.as_str(), "content": "alpha\nbeta\ngamma\n" }),
         )
         .expect("write update should succeed");
         let write_update_output: serde_json::Value =
@@ -8677,7 +9145,7 @@ mod tests {
         assert_eq!(write_update_output["type"], "update");
         assert_eq!(write_update_output["originalFile"], "alpha\nbeta\nalpha\n");
 
-        let read_full = execute_tool("read_file", &json!({ "path": "nested/demo.txt" }))
+        let read_full = execute_tool("read_file", &json!({ "path": demo_path_string.as_str() }))
             .expect("read full should succeed");
         let read_full_output: serde_json::Value = serde_json::from_str(&read_full).expect("json");
         assert_eq!(read_full_output["file"]["content"], "alpha\nbeta\ngamma");
@@ -8685,7 +9153,7 @@ mod tests {
 
         let read_slice = execute_tool(
             "read_file",
-            &json!({ "path": "nested/demo.txt", "offset": 1, "limit": 1 }),
+            &json!({ "path": demo_path_string.as_str(), "offset": 1, "limit": 1 }),
         )
         .expect("read slice should succeed");
         let read_slice_output: serde_json::Value = serde_json::from_str(&read_slice).expect("json");
@@ -8694,7 +9162,7 @@ mod tests {
 
         let read_past_end = execute_tool(
             "read_file",
-            &json!({ "path": "nested/demo.txt", "offset": 50 }),
+            &json!({ "path": demo_path_string.as_str(), "offset": 50 }),
         )
         .expect("read past EOF should succeed");
         let read_past_end_output: serde_json::Value =
@@ -8708,25 +9176,25 @@ mod tests {
 
         let edit_once = execute_tool(
             "edit_file",
-            &json!({ "path": "nested/demo.txt", "old_string": "alpha", "new_string": "omega" }),
+            &json!({ "path": demo_path_string.as_str(), "old_string": "alpha", "new_string": "omega" }),
         )
         .expect("single edit should succeed");
         let edit_once_output: serde_json::Value = serde_json::from_str(&edit_once).expect("json");
         assert_eq!(edit_once_output["replaceAll"], false);
         assert_eq!(
-            fs::read_to_string(root.join("nested/demo.txt")).expect("read file"),
+            fs::read_to_string(&demo_path).expect("read file"),
             "omega\nbeta\ngamma\n"
         );
 
         execute_tool(
             "write_file",
-            &json!({ "path": "nested/demo.txt", "content": "alpha\nbeta\nalpha\n" }),
+            &json!({ "path": demo_path_string.as_str(), "content": "alpha\nbeta\nalpha\n" }),
         )
         .expect("reset file");
         let edit_all = execute_tool(
             "edit_file",
             &json!({
-                "path": "nested/demo.txt",
+                "path": demo_path_string.as_str(),
                 "old_string": "alpha",
                 "new_string": "omega",
                 "replace_all": true
@@ -8736,25 +9204,24 @@ mod tests {
         let edit_all_output: serde_json::Value = serde_json::from_str(&edit_all).expect("json");
         assert_eq!(edit_all_output["replaceAll"], true);
         assert_eq!(
-            fs::read_to_string(root.join("nested/demo.txt")).expect("read file"),
+            fs::read_to_string(&demo_path).expect("read file"),
             "omega\nbeta\nomega\n"
         );
 
         let edit_same = execute_tool(
             "edit_file",
-            &json!({ "path": "nested/demo.txt", "old_string": "omega", "new_string": "omega" }),
+            &json!({ "path": demo_path_string.as_str(), "old_string": "omega", "new_string": "omega" }),
         )
         .expect_err("identical old/new should fail");
         assert!(edit_same.contains("must differ"));
 
         let edit_missing = execute_tool(
             "edit_file",
-            &json!({ "path": "nested/demo.txt", "old_string": "missing", "new_string": "omega" }),
+            &json!({ "path": demo_path_string.as_str(), "old_string": "missing", "new_string": "omega" }),
         )
         .expect_err("missing substring should fail");
         assert!(edit_missing.contains("old_string not found"));
 
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -8816,6 +9283,25 @@ mod tests {
         .expect("grep count should succeed");
         let grep_count_output: serde_json::Value = serde_json::from_str(&grep_count).expect("json");
         assert_eq!(grep_count_output["numMatches"], 3);
+        assert_eq!(grep_count_output["filenames"], json!([]));
+        let grep_count_content = grep_count_output["content"].as_str().expect("content");
+        let grep_count_lines = grep_count_content
+            .lines()
+            .map(|line| line.replace('\\', "/"))
+            .collect::<Vec<_>>();
+        assert_eq!(grep_count_lines.len(), 2);
+        assert!(
+            grep_count_lines
+                .iter()
+                .any(|line| line.ends_with("nested/lib.rs:2")),
+            "unexpected grep count lines: {grep_count_lines:?}"
+        );
+        assert!(
+            grep_count_lines
+                .iter()
+                .any(|line| line.ends_with("nested/notes.txt:1")),
+            "unexpected grep count lines: {grep_count_lines:?}"
+        );
 
         let grep_error = execute_tool(
             "grep_search",
@@ -9238,7 +9724,7 @@ printf 'pwsh:%s' "$1"
 
         let background_output: serde_json::Value = serde_json::from_str(&background).expect("json");
         assert!(background_output["backgroundTaskId"].as_str().is_some());
-        assert!(background_output.get("rawOutputPath").is_none());
+        assert!(background_output["rawOutputPath"].as_str().is_some());
         assert!(background_output.get("noOutputExpected").is_none());
         assert!(background_output["backgroundedByUser"].is_null());
         assert!(background_output["assistantAutoBackgrounded"].is_null());
@@ -9361,9 +9847,21 @@ printf 'pwsh:%s' "$1"
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        #[cfg(windows)]
+        if !windows_bash_smoke_ok() {
+            return;
+        }
+        #[cfg(windows)]
+        set_shell_if_windows().expect("set shell");
         let registry = super::GlobalToolRegistry::builtin();
         let result = registry
-            .execute("bash", &json!({ "command": "printf 'ok'" }))
+            .execute(
+                "bash",
+                &json!({
+                    "command": "printf 'ok'",
+                    "dangerouslyDisableSandbox": true
+                }),
+            )
             .expect("bash should succeed without enforcer");
         let output: serde_json::Value = serde_json::from_str(&result).expect("json");
         assert_eq!(output["stdout"], "ok");

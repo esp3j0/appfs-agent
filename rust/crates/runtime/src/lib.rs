@@ -40,6 +40,7 @@ pub mod summary_compression;
 pub mod task_packet;
 pub mod task_registry;
 pub mod team_cron_registry;
+mod tool_output;
 mod tool_session;
 #[cfg(test)]
 mod trust_resolver;
@@ -158,8 +159,10 @@ pub use sandbox::{
     SandboxRequest, SandboxStatus,
 };
 pub use session::{
-    ContentBlock, ConversationMessage, MessageRole, Session, SessionCompaction, SessionError,
-    SessionFork, SessionPromptEntry,
+    AttachmentKind, AttachmentMetadata, CompactBoundaryMetadata, CompactPreservedSegment,
+    CompactTrigger, ContentBlock, ConversationMessage, HookResultEvent, HookResultMetadata,
+    MessageRole, Session, SessionCompaction, SessionError, SessionFork, SessionPromptEntry,
+    SystemMessageSubtype,
 };
 pub use sse::{IncrementalSseParser, SseEvent};
 pub use stale_base::{
@@ -171,6 +174,7 @@ pub use stale_branch::{
     StaleBranchPolicy,
 };
 pub use task_packet::{validate_packet, TaskPacket, TaskPacketValidationError, ValidatedPacket};
+pub use tool_output::{tool_output_root, tool_result_path, tool_results_dir};
 #[cfg(test)]
 pub use trust_resolver::{TrustConfig, TrustDecision, TrustEvent, TrustPolicy, TrustResolver};
 pub use usage::{

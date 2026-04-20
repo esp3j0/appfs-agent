@@ -2829,6 +2829,58 @@ fn run_resume_command(
     session: &Session,
     command: &SlashCommand,
 ) -> Result<ResumeCommandOutcome, Box<dyn std::error::Error>> {
+    run_resume_command_with_compactor(session_path, session, command, &mut run_resume_full_compact)
+}
+
+fn run_resume_full_compact(
+    session: &Session,
+) -> Result<runtime::CompactionResult, Box<dyn std::error::Error>> {
+    let system_prompt = build_system_prompt()?;
+    let resolved_model = resolve_repl_model(DEFAULT_MODEL.to_string());
+    let mut runtime = build_runtime(
+        session.clone(),
+        &session.session_id,
+        resolved_model,
+        system_prompt,
+        true,
+        false,
+        None,
+        default_permission_mode(),
+        None,
+    )?;
+    Ok(runtime.compact(CompactionConfig {
+        max_estimated_tokens: 0,
+        ..CompactionConfig::default()
+    })?)
+}
+
+fn format_resume_compact_message(
+    removed: usize,
+    kept: usize,
+    skipped: bool,
+    user_display_message: Option<&str>,
+) -> String {
+    let mut message = format_compact_report(removed, kept, skipped);
+    if let Some(user_display_message) = user_display_message
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+    {
+        message.push('\n');
+        message.push_str(user_display_message);
+    }
+    message
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_resume_command_with_compactor<F>(
+    session_path: &Path,
+    session: &Session,
+    command: &SlashCommand,
+    compact_with_runtime: &mut F,
+) -> Result<ResumeCommandOutcome, Box<dyn std::error::Error>>
+where
+    F: FnMut(&Session) -> Result<runtime::CompactionResult, Box<dyn std::error::Error>>,
+{
     match command {
         SlashCommand::Help => Ok(ResumeCommandOutcome {
             session: session.clone(),
@@ -2836,20 +2888,19 @@ fn run_resume_command(
             json: None,
         }),
         SlashCommand::Compact => {
-            let result = runtime::compact_session(
-                session,
-                CompactionConfig {
-                    max_estimated_tokens: 0,
-                    ..CompactionConfig::default()
-                },
-            );
+            let result = compact_with_runtime(session)?;
             let removed = result.removed_message_count;
             let kept = result.compacted_session.messages.len();
             let skipped = removed == 0;
             result.compacted_session.save_to_path(session_path)?;
             Ok(ResumeCommandOutcome {
                 session: result.compacted_session,
-                message: Some(format_compact_report(removed, kept, skipped)),
+                message: Some(format_resume_compact_message(
+                    removed,
+                    kept,
+                    skipped,
+                    result.user_display_message.as_deref(),
+                )),
                 json: None,
             })
         }
@@ -4550,7 +4601,7 @@ impl LiveCli {
     }
 
     fn compact(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let result = self.runtime.compact(CompactionConfig::default());
+        let result = self.runtime.compact(CompactionConfig::default())?;
         let removed = result.removed_message_count;
         let kept = result.compacted_session.messages.len();
         let skipped = removed == 0;
@@ -4568,6 +4619,9 @@ impl LiveCli {
         self.replace_runtime(runtime)?;
         self.persist_session()?;
         println!("{}", format_compact_report(removed, kept, skipped));
+        if let Some(message) = result.user_display_message.as_deref() {
+            println!("{message}");
+        }
         Ok(())
     }
 
@@ -5510,9 +5564,14 @@ fn collect_hook_list_entries(
         &mut entries,
         "config",
         true,
-        runtime_config.hooks().pre_tool_use(),
-        runtime_config.hooks().post_tool_use(),
-        runtime_config.hooks().post_tool_use_failure(),
+        HookCommandSets {
+            pre_tool_use: runtime_config.hooks().pre_tool_use(),
+            post_tool_use: runtime_config.hooks().post_tool_use(),
+            post_tool_use_failure: runtime_config.hooks().post_tool_use_failure(),
+            pre_compact: runtime_config.hooks().pre_compact(),
+            post_compact: runtime_config.hooks().post_compact(),
+            session_start: runtime_config.hooks().session_start(),
+        },
     );
 
     let plugin_manager = build_plugin_manager(cwd, loader, runtime_config);
@@ -5522,31 +5581,71 @@ fn collect_hook_list_entries(
             &mut entries,
             &format!("plugin:{}", plugin.metadata().id),
             plugin.is_enabled(),
-            &plugin.hooks().pre_tool_use,
-            &plugin.hooks().post_tool_use,
-            &plugin.hooks().post_tool_use_failure,
+            HookCommandSets {
+                pre_tool_use: &plugin.hooks().pre_tool_use,
+                post_tool_use: &plugin.hooks().post_tool_use,
+                post_tool_use_failure: &plugin.hooks().post_tool_use_failure,
+                pre_compact: &plugin.hooks().pre_compact,
+                post_compact: &plugin.hooks().post_compact,
+                session_start: &plugin.hooks().session_start,
+            },
         );
     }
 
     Ok(entries)
 }
 
+#[derive(Clone, Copy)]
+struct HookCommandSets<'a> {
+    pre_tool_use: &'a [String],
+    post_tool_use: &'a [String],
+    post_tool_use_failure: &'a [String],
+    pre_compact: &'a [String],
+    post_compact: &'a [String],
+    session_start: &'a [String],
+}
+
 fn extend_hook_list_entries(
     entries: &mut Vec<HookListEntry>,
     source: &str,
     enabled: bool,
-    pre_tool_use: &[String],
-    post_tool_use: &[String],
-    post_tool_use_failure: &[String],
+    commands: HookCommandSets<'_>,
 ) {
-    append_hook_list_entries(entries, source, enabled, "PreToolUse", pre_tool_use);
-    append_hook_list_entries(entries, source, enabled, "PostToolUse", post_tool_use);
+    append_hook_list_entries(
+        entries,
+        source,
+        enabled,
+        "PreToolUse",
+        commands.pre_tool_use,
+    );
+    append_hook_list_entries(
+        entries,
+        source,
+        enabled,
+        "PostToolUse",
+        commands.post_tool_use,
+    );
     append_hook_list_entries(
         entries,
         source,
         enabled,
         "PostToolUseFailure",
-        post_tool_use_failure,
+        commands.post_tool_use_failure,
+    );
+    append_hook_list_entries(entries, source, enabled, "PreCompact", commands.pre_compact);
+    append_hook_list_entries(
+        entries,
+        source,
+        enabled,
+        "PostCompact",
+        commands.post_compact,
+    );
+    append_hook_list_entries(
+        entries,
+        source,
+        enabled,
+        "SessionStart",
+        commands.session_start,
     );
 }
 
@@ -6587,6 +6686,9 @@ fn runtime_hook_config_from_plugin_hooks(hooks: PluginHooks) -> runtime::Runtime
         hooks.post_tool_use,
         hooks.post_tool_use_failure,
     )
+    .with_pre_compact(hooks.pre_compact)
+    .with_post_compact(hooks.post_compact)
+    .with_session_start(hooks.session_start)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7202,15 +7304,15 @@ impl ApiClient for AnthropicRuntimeClient {
             progress_reporter.mark_model_phase();
         }
         let is_post_tool = request_ends_with_tool_result(&request);
+        let allow_tools = self.enable_tools && request.allow_tools;
         let message_request = MessageRequest {
             model: self.model.clone(),
             max_tokens: max_tokens_for_model(&self.model),
             messages: convert_messages(&request.messages),
             system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
-            tools: self
-                .enable_tools
+            tools: allow_tools
                 .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref())),
-            tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
+            tool_choice: allow_tools.then_some(ToolChoice::Auto),
             stream: true,
             ..Default::default()
         };
@@ -8583,7 +8685,8 @@ mod tests {
         render_memory_report, render_merged_runtime_config_json, render_prompt_history_report,
         render_repl_help, render_resume_usage, render_session_markdown, resolve_model_alias,
         resolve_model_alias_with_config, resolve_repl_model, resolve_session_reference,
-        response_to_events, resume_supported_slash_commands, run_resume_command, short_tool_id,
+        response_to_events, resume_supported_slash_commands, run_resume_command,
+        run_resume_command_with_compactor, short_tool_id,
         slash_command_completion_candidates_with_sessions, status_context, status_json_value,
         summarize_tool_payload_for_markdown, validate_no_args, write_mcp_server_fixture, CliAction,
         CliOutputFormat, CliPermissionPrompter, CliToolExecutor, GitBranchFreshness,
@@ -9909,16 +10012,12 @@ mod tests {
                     input: r#"{"command":"ls -la"}"#.to_string(),
                 },
             ]),
-            ConversationMessage {
-                role: MessageRole::Tool,
-                blocks: vec![ContentBlock::ToolResult {
-                    tool_use_id: "toolu_abcdefghijklmnop".to_string(),
-                    tool_name: "bash".to_string(),
-                    output: "total 8\ndrwxr-xr-x  2 user staff   64 Apr  7 12:00 .".to_string(),
-                    is_error: false,
-                }],
-                usage: None,
-            },
+            ConversationMessage::tool_result(
+                "toolu_abcdefghijklmnop",
+                "bash",
+                "total 8\ndrwxr-xr-x  2 user staff   64 Apr  7 12:00 .",
+                false,
+            ),
         ];
 
         // when
@@ -9949,16 +10048,12 @@ mod tests {
         // given
         let mut session = Session::new();
         session.session_id = "errs".to_string();
-        session.messages = vec![ConversationMessage {
-            role: MessageRole::Tool,
-            blocks: vec![ContentBlock::ToolResult {
-                tool_use_id: "short".to_string(),
-                tool_name: "read_file".to_string(),
-                output: "   ".to_string(),
-                is_error: true,
-            }],
-            usage: None,
-        }];
+        session.messages = vec![ConversationMessage::tool_result(
+            "short",
+            "read_file",
+            "   ",
+            true,
+        )];
 
         // when
         let markdown =
@@ -11163,6 +11258,73 @@ UU conflicted.rs",
     }
 
     #[test]
+    fn resume_compact_uses_runtime_compactor_and_persists_result() {
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("root dir");
+        let session_path = root.join("session.jsonl");
+        let mut original = Session::new();
+        original
+            .push_user_text("Preserve compact context")
+            .expect("session should append");
+        original
+            .save_to_path(&session_path)
+            .expect("session should save");
+
+        let session = Session::load_from_path(&session_path).expect("session should load");
+        let mut compacted_session = session.clone();
+        compacted_session.messages = vec![
+            ConversationMessage::compact_boundary(runtime::CompactBoundaryMetadata {
+                trigger: runtime::CompactTrigger::Manual,
+                pre_tokens: 42,
+                user_context: None,
+                messages_summarized: Some(1),
+                pre_compact_discovered_tools: Vec::new(),
+                preserved_segment: None,
+            }),
+            ConversationMessage::compact_summary_user_text(
+                "This session is being continued from a previous conversation.\nSummary:\nCarry over prior work.",
+                true,
+            ),
+            ConversationMessage::attachment_user_text(
+                "Previously invoked skills remain available after compaction.",
+                runtime::AttachmentKind::InvokedSkills,
+            ),
+        ];
+        compacted_session.record_compaction("Carry over prior work.", 1);
+
+        let mut compactor_called = false;
+        let outcome = run_resume_command_with_compactor(
+            &session_path,
+            &session,
+            &SlashCommand::Compact,
+            &mut |input_session| {
+                compactor_called = true;
+                assert_eq!(input_session.messages.len(), 1);
+                Ok(runtime::CompactionResult {
+                    summary: "Carry over prior work.".to_string(),
+                    formatted_summary: "formatted".to_string(),
+                    compacted_session: compacted_session.clone(),
+                    removed_message_count: 1,
+                    user_display_message: Some("pre compact note\npost compact note".to_string()),
+                })
+            },
+        )
+        .expect("resume compact should succeed");
+
+        let restored = Session::load_from_path(&session_path).expect("session should reload");
+        assert!(compactor_called);
+        assert_eq!(outcome.session, compacted_session);
+        assert_eq!(restored, compacted_session);
+        let message = outcome.message.expect("resume compact report should exist");
+        assert!(message.contains("Result           compacted"));
+        assert!(message.contains("Messages removed 1"));
+        assert!(message.contains("pre compact note"));
+        assert!(message.contains("post compact note"));
+
+        remove_dir_all_with_retry(&root);
+    }
+
+    #[test]
     fn branch_delete_removes_only_merged_unprotected_local_branches() {
         let _guard = cwd_lock()
             .lock()
@@ -11470,16 +11632,7 @@ UU conflicted.rs",
                 name: "bash".to_string(),
                 input: "{\"command\":\"pwd\"}".to_string(),
             }]),
-            ConversationMessage {
-                role: MessageRole::Tool,
-                blocks: vec![ContentBlock::ToolResult {
-                    tool_use_id: "tool-1".to_string(),
-                    tool_name: "bash".to_string(),
-                    output: "ok".to_string(),
-                    is_error: false,
-                }],
-                usage: None,
-            },
+            ConversationMessage::tool_result("tool-1", "bash", "ok", false),
         ];
 
         let converted = super::convert_messages(&messages);
