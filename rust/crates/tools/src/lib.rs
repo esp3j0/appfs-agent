@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -22,13 +24,15 @@ use runtime::{
     summary_compression::compress_summary_text,
     task_registry::TaskRegistry,
     team_cron_registry::{CronRegistry, TeamRegistry},
+    tool_result_path,
     worker_boot::{WorkerReadySnapshot, WorkerRegistry, WorkerTaskReceipt},
     write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, BashCommandOutput,
     BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage, ConversationRuntime,
-    GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneEventName,
-    LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole, OAuthConfig, PermissionMode,
-    PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeConfig, RuntimeError,
-    RuntimeProviderConfig, RuntimeProviderKind, Session, TaskPacket, ToolError, ToolExecutor,
+    GlobSearchOutput, GrepSearchInput, GrepSearchOutput, LaneCommitProvenance, LaneEvent,
+    LaneEventBlocker, LaneEventName, LaneEventStatus, LaneFailureClass, McpDegradedReport,
+    MessageRole, OAuthConfig, PermissionMode, PermissionPolicy, PromptCacheEvent,
+    ProviderFallbackConfig, RuntimeConfig, RuntimeError, RuntimeProviderConfig,
+    RuntimeProviderKind, Session, TaskPacket, ToolError, ToolExecutor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -483,7 +487,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "-n": { "type": "boolean" },
                     "-i": { "type": "boolean" },
                     "type": { "type": "string" },
-                    "head_limit": { "type": "integer", "minimum": 1 },
+                    "head_limit": { "type": "integer", "minimum": 0 },
                     "offset": { "type": "integer", "minimum": 0 },
                     "multiline": { "type": "boolean" }
                 },
@@ -4187,6 +4191,8 @@ const PERSISTED_OUTPUT_TAG: &str = "<persisted-output>";
 const PERSISTED_OUTPUT_CLOSING_TAG: &str = "</persisted-output>";
 const PERSISTED_OUTPUT_PREVIEW_BYTES: usize = 2_000;
 const INTERRUPTED_COMMAND_TAG: &str = "<error>Command was aborted before completion</error>";
+const GLOB_RESULT_PERSIST_THRESHOLD_CHARS: usize = 100_000;
+const GREP_RESULT_PERSIST_THRESHOLD_CHARS: usize = 20_000;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelVisibleToolResult {
@@ -4211,17 +4217,35 @@ pub fn model_visible_tool_result(
     output: &str,
     is_error: bool,
 ) -> ModelVisibleToolResult {
-    if !matches!(tool_name, "bash" | "PowerShell") {
-        return ModelVisibleToolResult::raw_text(output, is_error);
+    model_visible_tool_result_with_id(None, tool_name, output, is_error)
+}
+
+fn model_visible_tool_result_with_id(
+    tool_use_id: Option<&str>,
+    tool_name: &str,
+    output: &str,
+    is_error: bool,
+) -> ModelVisibleToolResult {
+    if let Some((shell_output, trailing_text)) = parse_shell_tool_result(tool_name, output) {
+        let mut result = shell_tool_result_to_model_visible_result(&shell_output, is_error);
+        append_trailing_tool_text(&mut result.content, trailing_text);
+        return result;
     }
 
-    let Some((shell_output, trailing_text)) = parse_shell_tool_result(tool_name, output) else {
-        return ModelVisibleToolResult::raw_text(output, is_error);
-    };
+    if let Some((search_output, trailing_text)) = parse_search_tool_result(tool_name, output) {
+        let mut result =
+            search_tool_result_to_model_visible_result(tool_use_id, &search_output, is_error);
+        append_trailing_tool_text(&mut result.content, trailing_text);
+        return result;
+    }
 
-    let mut result = shell_tool_result_to_model_visible_result(&shell_output, is_error);
-    append_trailing_tool_text(&mut result.content, trailing_text);
-    result
+    ModelVisibleToolResult::raw_text(output, is_error)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SearchToolResult {
+    text: String,
+    persistence_threshold_chars: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -4319,6 +4343,41 @@ fn parse_shell_tool_result_json(
         "PowerShell" => serde_json::from_str::<PowerShellCommandOutput>(output)
             .ok()
             .map(NormalizedShellToolResult::from),
+        _ => None,
+    }
+}
+
+fn parse_search_tool_result<'a>(
+    tool_name: &str,
+    output: &'a str,
+) -> Option<(SearchToolResult, &'a str)> {
+    if let Some(parsed) = parse_search_tool_result_json(tool_name, output) {
+        return Some((parsed, ""));
+    }
+
+    let (json_prefix, trailing_text) = split_json_prefix(output)?;
+    let parsed = parse_search_tool_result_json(tool_name, json_prefix)?;
+    Some((parsed, trailing_text))
+}
+
+fn parse_search_tool_result_json(tool_name: &str, output: &str) -> Option<SearchToolResult> {
+    match tool_name {
+        "glob_search" | "Glob" => {
+            serde_json::from_str::<GlobSearchOutput>(output)
+                .ok()
+                .map(|result| SearchToolResult {
+                    text: glob_tool_result_text(&result),
+                    persistence_threshold_chars: GLOB_RESULT_PERSIST_THRESHOLD_CHARS,
+                })
+        }
+        "grep_search" | "Grep" => {
+            serde_json::from_str::<GrepSearchOutput>(output)
+                .ok()
+                .map(|result| SearchToolResult {
+                    text: grep_tool_result_text(&result),
+                    persistence_threshold_chars: GREP_RESULT_PERSIST_THRESHOLD_CHARS,
+                })
+        }
         _ => None,
     }
 }
@@ -4431,6 +4490,136 @@ fn shell_tool_result_to_model_visible_result(
     }
 }
 
+fn search_tool_result_to_model_visible_result(
+    tool_use_id: Option<&str>,
+    output: &SearchToolResult,
+    is_error: bool,
+) -> ModelVisibleToolResult {
+    let mut text = output.text.clone();
+    if text.chars().count() > output.persistence_threshold_chars {
+        if let Some(tool_use_id) = tool_use_id {
+            if let Ok(persisted) = persist_model_visible_tool_text(tool_use_id, &text) {
+                let (preview, has_more) =
+                    generate_tool_result_preview(&text, PERSISTED_OUTPUT_PREVIEW_BYTES);
+                text = build_large_tool_result_message(
+                    &persisted.path,
+                    persisted.original_size,
+                    &preview,
+                    has_more,
+                );
+            }
+        }
+    }
+
+    ModelVisibleToolResult {
+        content: vec![ToolResultContentBlock::Text { text }],
+        is_error,
+    }
+}
+
+fn glob_tool_result_text(output: &GlobSearchOutput) -> String {
+    if output.num_files == 0 {
+        return String::from("No files found");
+    }
+
+    let mut lines = output.filenames.clone();
+    if output.truncated {
+        lines.push(String::from(
+            "(Results are truncated. Consider using a more specific path or pattern.)",
+        ));
+    }
+    lines.join("\n")
+}
+
+fn grep_tool_result_text(output: &GrepSearchOutput) -> String {
+    let mode = output.mode.as_deref().unwrap_or("files_with_matches");
+    let limit_info = format_search_limit_info(output.applied_limit, output.applied_offset);
+
+    match mode {
+        "content" => {
+            let mut result = output
+                .content
+                .clone()
+                .unwrap_or_else(|| String::from("No matches found"));
+            if !limit_info.is_empty() {
+                result.push_str("\n\n[Showing results with pagination = ");
+                result.push_str(&limit_info);
+                result.push(']');
+            }
+            result
+        }
+        "count" => {
+            let raw_content = output
+                .content
+                .clone()
+                .unwrap_or_else(|| String::from("No matches found"));
+            let matches = output.num_matches.unwrap_or(0);
+            let files = output.num_files;
+            let summary = if limit_info.is_empty() {
+                format!(
+                    "\n\nFound {matches} total {} across {files} {}.",
+                    if matches == 1 {
+                        "occurrence"
+                    } else {
+                        "occurrences"
+                    },
+                    if files == 1 { "file" } else { "files" }
+                )
+            } else {
+                format!(
+                    "\n\nFound {matches} total {} across {files} {}. with pagination = {limit_info}",
+                    if matches == 1 {
+                        "occurrence"
+                    } else {
+                        "occurrences"
+                    },
+                    if files == 1 { "file" } else { "files" }
+                )
+            };
+            format!("{raw_content}{summary}")
+        }
+        _ => {
+            if output.num_files == 0 {
+                return String::from("No files found");
+            }
+
+            let header = if limit_info.is_empty() {
+                format!(
+                    "Found {} {}",
+                    output.num_files,
+                    if output.num_files == 1 {
+                        "file"
+                    } else {
+                        "files"
+                    }
+                )
+            } else {
+                format!(
+                    "Found {} {} {limit_info}",
+                    output.num_files,
+                    if output.num_files == 1 {
+                        "file"
+                    } else {
+                        "files"
+                    }
+                )
+            };
+            format!("{header}\n{}", output.filenames.join("\n"))
+        }
+    }
+}
+
+fn format_search_limit_info(applied_limit: Option<usize>, applied_offset: Option<usize>) -> String {
+    let mut parts = Vec::new();
+    if let Some(limit) = applied_limit {
+        parts.push(format!("limit: {limit}"));
+    }
+    if let Some(offset) = applied_offset {
+        parts.push(format!("offset: {offset}"));
+    }
+    parts.join(", ")
+}
+
 fn tool_result_content_block_from_value(value: &Value) -> ToolResultContentBlock {
     match value {
         Value::String(text) => ToolResultContentBlock::Text { text: text.clone() },
@@ -4498,6 +4687,34 @@ fn build_large_tool_result_message(
     }
     message.push_str(PERSISTED_OUTPUT_CLOSING_TAG);
     message
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PersistedModelVisibleToolText {
+    path: String,
+    original_size: u64,
+}
+
+fn persist_model_visible_tool_text(
+    tool_use_id: &str,
+    content: &str,
+) -> std::io::Result<PersistedModelVisibleToolText> {
+    let cwd = std::env::current_dir()?;
+    let path = tool_result_path(&cwd, tool_use_id, "txt");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    match OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(mut file) => file.write_all(content.as_bytes())?,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+
+    Ok(PersistedModelVisibleToolText {
+        path: path.to_string_lossy().into_owned(),
+        original_size: u64::try_from(content.len()).expect("content length fits u64"),
+    })
 }
 
 fn format_file_size(size_in_bytes: u64) -> String {
@@ -4614,7 +4831,12 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                         is_error,
                         ..
                     } => {
-                        let result = model_visible_tool_result(tool_name, output, *is_error);
+                        let result = model_visible_tool_result_with_id(
+                            Some(tool_use_id),
+                            tool_name,
+                            output,
+                            *is_error,
+                        );
                         InputContentBlock::ToolResult {
                             tool_use_id: tool_use_id.clone(),
                             content: result.content,
@@ -6050,19 +6272,19 @@ mod tests {
     use super::{
         agent_permission_policy, allowed_tools_for_subagent, classify_lane_failure,
         derive_agent_state, execute_agent_with_spawn, execute_tool, final_assistant_text,
-        maybe_commit_provenance, model_visible_tool_result, mvp_tool_specs,
-        permission_mode_from_plugin, persist_agent_terminal_state, push_output_block,
-        run_task_packet, AgentInput, AgentJob, GlobalToolRegistry, LaneEventName, LaneFailureClass,
-        ModelVisibleToolResult, PowerShellCommandOutput, ProviderRuntimeClient,
-        SubagentToolExecutor,
+        maybe_commit_provenance, model_visible_tool_result, model_visible_tool_result_with_id,
+        mvp_tool_specs, permission_mode_from_plugin, persist_agent_terminal_state,
+        push_output_block, run_task_packet, AgentInput, AgentJob, GlobalToolRegistry,
+        LaneEventName, LaneFailureClass, ModelVisibleToolResult, PowerShellCommandOutput,
+        ProviderRuntimeClient, SubagentToolExecutor,
     };
     use api::{OutputContentBlock, ToolResultContentBlock};
-    use runtime::ProviderFallbackConfig;
     use runtime::{
         permission_enforcer::PermissionEnforcer, ApiRequest, AssistantEvent, BashCommandOutput,
         ConversationRuntime, PermissionMode, PermissionPolicy, RuntimeError, Session, TaskPacket,
         ToolExecutor,
     };
+    use runtime::{tool_result_path, GlobSearchOutput, GrepSearchOutput, ProviderFallbackConfig};
     use serde_json::json;
 
     fn env_lock() -> &'static Mutex<()> {
@@ -6135,6 +6357,14 @@ mod tests {
         tool_name: &str,
     ) -> ModelVisibleToolResult {
         let serialized = serde_json::to_string_pretty(output).expect("serialize shell output");
+        model_visible_tool_result(tool_name, &serialized, false)
+    }
+
+    fn search_model_result<T: serde::Serialize>(
+        output: &T,
+        tool_name: &str,
+    ) -> ModelVisibleToolResult {
+        let serialized = serde_json::to_string_pretty(output).expect("serialize search output");
         model_visible_tool_result(tool_name, &serialized, false)
     }
 
@@ -6320,6 +6550,153 @@ mod tests {
         assert!(text.contains(
             "In assistant mode, delegate long-running work to a subagent or use run_in_background to keep this conversation responsive."
         ));
+    }
+
+    #[test]
+    fn model_visible_tool_result_formats_glob_results_like_ts() {
+        let result = search_model_result(
+            &GlobSearchOutput {
+                duration_ms: 5,
+                num_files: 2,
+                filenames: vec!["src/lib.rs".to_string(), "src/main.rs".to_string()],
+                truncated: false,
+            },
+            "glob_search",
+        );
+
+        assert_eq!(
+            result,
+            ModelVisibleToolResult {
+                content: vec![ToolResultContentBlock::Text {
+                    text: "src/lib.rs\nsrc/main.rs".to_string(),
+                }],
+                is_error: false,
+            }
+        );
+    }
+
+    #[test]
+    fn model_visible_tool_result_formats_empty_glob_results_like_ts() {
+        let result = search_model_result(
+            &GlobSearchOutput {
+                duration_ms: 3,
+                num_files: 0,
+                filenames: Vec::new(),
+                truncated: false,
+            },
+            "glob_search",
+        );
+
+        assert_eq!(
+            result,
+            ModelVisibleToolResult {
+                content: vec![ToolResultContentBlock::Text {
+                    text: "No files found".to_string(),
+                }],
+                is_error: false,
+            }
+        );
+    }
+
+    #[test]
+    fn model_visible_tool_result_formats_grep_count_results_like_ts() {
+        let result = search_model_result(
+            &GrepSearchOutput {
+                mode: Some("count".to_string()),
+                num_files: 2,
+                filenames: Vec::new(),
+                num_lines: None,
+                content: Some("src/lib.rs:2\nsrc/main.rs:1".to_string()),
+                num_matches: Some(3),
+                applied_limit: Some(10),
+                applied_offset: Some(5),
+            },
+            "grep_search",
+        );
+
+        assert_eq!(
+            result,
+            ModelVisibleToolResult {
+                content: vec![ToolResultContentBlock::Text {
+                    text: "src/lib.rs:2\nsrc/main.rs:1\n\nFound 3 total occurrences across 2 files. with pagination = limit: 10, offset: 5".to_string(),
+                }],
+                is_error: false,
+            }
+        );
+    }
+
+    #[test]
+    fn model_visible_tool_result_formats_grep_files_with_matches_like_ts() {
+        let result = search_model_result(
+            &GrepSearchOutput {
+                mode: Some("files_with_matches".to_string()),
+                num_files: 2,
+                filenames: vec!["src/lib.rs".to_string(), "src/main.rs".to_string()],
+                num_lines: None,
+                content: None,
+                num_matches: None,
+                applied_limit: Some(25),
+                applied_offset: Some(3),
+            },
+            "grep_search",
+        );
+
+        assert_eq!(
+            result,
+            ModelVisibleToolResult {
+                content: vec![ToolResultContentBlock::Text {
+                    text: "Found 2 files limit: 25, offset: 3\nsrc/lib.rs\nsrc/main.rs".to_string(),
+                }],
+                is_error: false,
+            }
+        );
+    }
+
+    #[test]
+    fn model_visible_tool_result_persists_large_grep_results_for_tool_use_id() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("grep-wrapper-persist");
+        fs::create_dir_all(&root).expect("create root");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let content = "alpha\n".repeat(4_100);
+        let serialized = serde_json::to_string_pretty(&GrepSearchOutput {
+            mode: Some("content".to_string()),
+            num_files: 0,
+            filenames: Vec::new(),
+            num_lines: Some(4_100),
+            content: Some(content.clone()),
+            num_matches: None,
+            applied_limit: None,
+            applied_offset: None,
+        })
+        .expect("serialize grep output");
+
+        let result = model_visible_tool_result_with_id(
+            Some("tool:grep/1"),
+            "grep_search",
+            &serialized,
+            false,
+        );
+        let persisted_path = tool_result_path(&root, "tool:grep/1", "txt");
+
+        let ToolResultContentBlock::Text { text } = &result.content[0] else {
+            panic!("expected text block");
+        };
+        assert!(text.starts_with("<persisted-output>\n"));
+        assert!(text.contains(persisted_path.to_string_lossy().as_ref()));
+        assert!(persisted_path.exists(), "persisted output should exist");
+        assert_eq!(
+            fs::read_to_string(&persisted_path).expect("read persisted output"),
+            content
+        );
+        assert!(!result.is_error);
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = fs::remove_dir_all(root);
     }
 
     fn temp_path(name: &str) -> PathBuf {
@@ -8839,6 +9216,12 @@ mod tests {
         .expect("grep count should succeed");
         let grep_count_output: serde_json::Value = serde_json::from_str(&grep_count).expect("json");
         assert_eq!(grep_count_output["numMatches"], 3);
+        assert_eq!(grep_count_output["filenames"], json!([]));
+        let grep_count_content = grep_count_output["content"].as_str().expect("content");
+        assert_eq!(
+            grep_count_content.replace('\\', "/"),
+            "nested/lib.rs:2\nnested/notes.txt:1"
+        );
 
         let grep_error = execute_tool(
             "grep_search",

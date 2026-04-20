@@ -15,15 +15,12 @@ use crate::sandbox::{
     build_linux_sandbox_command, resolve_sandbox_status_for_request, FilesystemIsolationMode,
     SandboxConfig, SandboxStatus,
 };
-use crate::tool_session::current_tool_session_storage_root;
+use crate::tool_output::{task_outputs_dir, tool_results_dir};
 #[cfg(windows)]
 use crate::windows_path_to_posix_path;
 use crate::{bash_shell_path, ConfigLoader};
 
 static SHELL_OUTPUT_COUNTER: AtomicU64 = AtomicU64::new(0);
-const CLAW_STATE_DIR: &str = ".claw";
-const TOOL_RESULTS_DIR: &str = "tool-results";
-const TASK_OUTPUTS_DIR: &str = "tasks";
 const MAX_PERSISTED_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
 const SHELL_TASK_ID_ALPHABET: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 
@@ -270,21 +267,9 @@ fn persist_stdout_for_model(cwd: &Path, stdout: &[u8]) -> io::Result<PersistedSh
     })
 }
 
-fn tool_results_dir(cwd: &Path) -> PathBuf {
-    shell_output_root(cwd).join(TOOL_RESULTS_DIR)
-}
-
-fn task_outputs_dir(cwd: &Path) -> PathBuf {
-    shell_output_root(cwd).join(TASK_OUTPUTS_DIR)
-}
-
 #[must_use]
 pub fn shell_task_output_path(cwd: &Path, task_id: &str) -> PathBuf {
     task_outputs_dir(cwd).join(format!("{task_id}.output"))
-}
-
-fn shell_output_root(cwd: &Path) -> PathBuf {
-    current_tool_session_storage_root(cwd).unwrap_or_else(|| cwd.join(CLAW_STATE_DIR))
 }
 
 fn next_shell_task_id() -> String {

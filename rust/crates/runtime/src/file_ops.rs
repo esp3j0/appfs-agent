@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use glob::Pattern;
-use regex::RegexBuilder;
+use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
@@ -286,10 +286,11 @@ pub fn edit_file(
 
 pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOutput> {
     let started = Instant::now();
+    let cwd = std::env::current_dir()?;
     let base_dir = path
         .map(normalize_path)
         .transpose()?
-        .unwrap_or(std::env::current_dir()?);
+        .unwrap_or_else(|| cwd.clone());
     let search_pattern = if Path::new(pattern).is_absolute() {
         pattern.to_owned()
     } else {
@@ -316,7 +317,7 @@ pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOu
     let filenames = matches
         .into_iter()
         .take(100)
-        .map(|path| path.to_string_lossy().into_owned())
+        .map(|path| relative_display_path(&path, &cwd))
         .collect::<Vec<_>>();
 
     Ok(GlobSearchOutput {
@@ -328,25 +329,16 @@ pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOu
 }
 
 pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
+    let cwd = std::env::current_dir()?;
     let base_path = input
         .path
         .as_deref()
         .map(normalize_path)
         .transpose()?
-        .unwrap_or(std::env::current_dir()?);
+        .unwrap_or_else(|| cwd.clone());
 
-    let regex = RegexBuilder::new(&input.pattern)
-        .case_insensitive(input.case_insensitive.unwrap_or(false))
-        .dot_matches_new_line(input.multiline.unwrap_or(false))
-        .build()
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-
-    let glob_filter = input
-        .glob
-        .as_deref()
-        .map(Pattern::new)
-        .transpose()
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+    let regex = build_grep_regex(input)?;
+    let glob_filter = build_grep_glob_filter(input)?;
     let file_type = input.file_type.as_deref();
     let output_mode = input
         .output_mode
@@ -354,9 +346,9 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
         .unwrap_or_else(|| String::from("files_with_matches"));
     let context = input.context.or(input.context_short).unwrap_or(0);
 
-    let mut filenames = Vec::new();
+    let mut matched_files = Vec::new();
     let mut content_lines = Vec::new();
-    let mut total_matches = 0usize;
+    let mut count_entries = Vec::new();
 
     for file_path in collect_search_files(&base_path)? {
         if !matches_optional_filters(&file_path, glob_filter.as_ref(), file_type) {
@@ -370,70 +362,51 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
         if output_mode == "count" {
             let count = regex.find_iter(&file_contents).count();
             if count > 0 {
-                filenames.push(file_path.to_string_lossy().into_owned());
-                total_matches += count;
+                count_entries.push((file_path, count));
             }
             continue;
         }
 
         let lines: Vec<&str> = file_contents.lines().collect();
-        let mut matched_lines = Vec::new();
-        for (index, line) in lines.iter().enumerate() {
-            if regex.is_match(line) {
-                total_matches += 1;
-                matched_lines.push(index);
-            }
-        }
+        let matched_lines = matching_line_indices(&lines, &regex);
 
         if matched_lines.is_empty() {
             continue;
         }
 
-        filenames.push(file_path.to_string_lossy().into_owned());
+        matched_files.push(file_path.clone());
         if output_mode == "content" {
-            for index in matched_lines {
-                let start = index.saturating_sub(input.before.unwrap_or(context));
-                let end = (index + input.after.unwrap_or(context) + 1).min(lines.len());
-                for (current, line) in lines.iter().enumerate().take(end).skip(start) {
-                    let prefix = if input.line_numbers.unwrap_or(true) {
-                        format!("{}:{}:", file_path.to_string_lossy(), current + 1)
-                    } else {
-                        format!("{}:", file_path.to_string_lossy())
-                    };
-                    content_lines.push(format!("{prefix}{line}"));
-                }
-            }
+            append_content_matches(
+                &mut content_lines,
+                &file_path,
+                &cwd,
+                &lines,
+                &matched_lines,
+                input,
+                context,
+            );
         }
     }
 
-    let (filenames, applied_limit, applied_offset) =
-        apply_limit(filenames, input.head_limit, input.offset);
-    let content_output = if output_mode == "content" {
-        let (lines, limit, offset) = apply_limit(content_lines, input.head_limit, input.offset);
-        return Ok(GrepSearchOutput {
-            mode: Some(output_mode),
-            num_files: filenames.len(),
-            filenames,
-            num_lines: Some(lines.len()),
-            content: Some(lines.join("\n")),
-            num_matches: None,
-            applied_limit: limit,
-            applied_offset: offset,
-        });
-    } else {
-        None
-    };
+    if output_mode == "content" {
+        return Ok(build_grep_content_output(content_lines, input, output_mode));
+    }
 
-    Ok(GrepSearchOutput {
-        mode: Some(output_mode.clone()),
-        num_files: filenames.len(),
-        filenames,
-        content: content_output,
-        num_lines: None,
-        num_matches: (output_mode == "count").then_some(total_matches),
-        applied_limit,
-        applied_offset,
-    })
+    if output_mode == "count" {
+        return Ok(build_grep_count_output(
+            count_entries,
+            &cwd,
+            input,
+            output_mode,
+        ));
+    }
+
+    Ok(build_grep_files_output(
+        matched_files,
+        &cwd,
+        input,
+        output_mode,
+    ))
 }
 
 fn collect_search_files(base_path: &Path) -> io::Result<Vec<PathBuf>> {
@@ -473,6 +446,130 @@ fn matches_optional_filters(
     true
 }
 
+fn build_grep_regex(input: &GrepSearchInput) -> io::Result<Regex> {
+    RegexBuilder::new(&input.pattern)
+        .case_insensitive(input.case_insensitive.unwrap_or(false))
+        .dot_matches_new_line(input.multiline.unwrap_or(false))
+        .build()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))
+}
+
+fn build_grep_glob_filter(input: &GrepSearchInput) -> io::Result<Option<Pattern>> {
+    input
+        .glob
+        .as_deref()
+        .map(Pattern::new)
+        .transpose()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))
+}
+
+fn matching_line_indices(lines: &[&str], regex: &Regex) -> Vec<usize> {
+    lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| regex.is_match(line).then_some(index))
+        .collect()
+}
+
+fn append_content_matches(
+    content_lines: &mut Vec<String>,
+    file_path: &Path,
+    cwd: &Path,
+    lines: &[&str],
+    matched_lines: &[usize],
+    input: &GrepSearchInput,
+    context: usize,
+) {
+    let display_path = relative_display_path(file_path, cwd);
+    for index in matched_lines {
+        let start = index.saturating_sub(input.before.unwrap_or(context));
+        let end = (index + input.after.unwrap_or(context) + 1).min(lines.len());
+        for (current, line) in lines.iter().enumerate().take(end).skip(start) {
+            let prefix = if input.line_numbers.unwrap_or(true) {
+                format!("{display_path}:{}:", current + 1)
+            } else {
+                format!("{display_path}:")
+            };
+            content_lines.push(format!("{prefix}{line}"));
+        }
+    }
+}
+
+fn build_grep_content_output(
+    content_lines: Vec<String>,
+    input: &GrepSearchInput,
+    output_mode: String,
+) -> GrepSearchOutput {
+    let (lines, applied_limit, applied_offset) =
+        apply_limit(content_lines, input.head_limit, input.offset);
+    GrepSearchOutput {
+        mode: Some(output_mode),
+        num_files: 0,
+        filenames: Vec::new(),
+        num_lines: Some(lines.len()),
+        content: Some(lines.join("\n")),
+        num_matches: None,
+        applied_limit,
+        applied_offset,
+    }
+}
+
+fn build_grep_count_output(
+    count_entries: Vec<(PathBuf, usize)>,
+    cwd: &Path,
+    input: &GrepSearchInput,
+    output_mode: String,
+) -> GrepSearchOutput {
+    let count_lines = count_entries
+        .into_iter()
+        .map(|(path, count)| format!("{}:{count}", relative_display_path(&path, cwd)))
+        .collect::<Vec<_>>();
+    let (lines, applied_limit, applied_offset) =
+        apply_limit(count_lines, input.head_limit, input.offset);
+    let total_matches = lines
+        .iter()
+        .filter_map(|line| line.rsplit_once(':'))
+        .filter_map(|(_, count)| count.parse::<usize>().ok())
+        .sum::<usize>();
+
+    GrepSearchOutput {
+        mode: Some(output_mode),
+        num_files: lines.len(),
+        filenames: Vec::new(),
+        content: Some(lines.join("\n")),
+        num_lines: None,
+        num_matches: Some(total_matches),
+        applied_limit,
+        applied_offset,
+    }
+}
+
+fn build_grep_files_output(
+    mut matched_files: Vec<PathBuf>,
+    cwd: &Path,
+    input: &GrepSearchInput,
+    output_mode: String,
+) -> GrepSearchOutput {
+    sort_paths_by_modified_desc(&mut matched_files);
+    let relative_matches = matched_files
+        .into_iter()
+        .map(|path| relative_display_path(&path, cwd))
+        .collect::<Vec<_>>();
+    let (filenames, applied_limit, applied_offset) =
+        apply_limit(relative_matches, input.head_limit, input.offset);
+
+    GrepSearchOutput {
+        mode: Some(output_mode),
+        num_files: filenames.len(),
+        filenames,
+        content: None,
+        num_lines: None,
+        num_matches: None,
+        applied_limit,
+        applied_offset,
+    }
+}
+
 fn apply_limit<T>(
     items: Vec<T>,
     limit: Option<usize>,
@@ -492,6 +589,84 @@ fn apply_limit<T>(
         truncated.then_some(explicit_limit),
         (offset_value > 0).then_some(offset_value),
     )
+}
+
+fn sort_paths_by_modified_desc(paths: &mut [PathBuf]) {
+    paths.sort_by(|left, right| {
+        let left_modified = fs::metadata(left)
+            .and_then(|metadata| metadata.modified())
+            .ok();
+        let right_modified = fs::metadata(right)
+            .and_then(|metadata| metadata.modified())
+            .ok();
+        right_modified.cmp(&left_modified).then_with(|| {
+            let left_display = left.to_string_lossy();
+            let right_display = right.to_string_lossy();
+            left_display.as_ref().cmp(right_display.as_ref())
+        })
+    });
+}
+
+fn relative_display_path(path: &Path, cwd: &Path) -> String {
+    let normalized_path = normalize_display_path(path);
+    let normalized_cwd = normalize_display_path(cwd);
+    diff_paths(&normalized_path, &normalized_cwd)
+        .unwrap_or(normalized_path)
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn normalize_display_path(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let raw = path.to_string_lossy();
+        if let Some(stripped) = raw.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{stripped}"));
+        }
+        if let Some(stripped) = raw.strip_prefix(r"\\?\") {
+            return PathBuf::from(stripped);
+        }
+    }
+
+    path.to_path_buf()
+}
+
+fn diff_paths(path: &Path, base: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+
+    let path_components = path.components().collect::<Vec<_>>();
+    let base_components = base.components().collect::<Vec<_>>();
+
+    match (path_components.first(), base_components.first()) {
+        (Some(Component::Prefix(path_prefix)), Some(Component::Prefix(base_prefix)))
+            if path_prefix.kind() != base_prefix.kind() =>
+        {
+            return None;
+        }
+        (Some(Component::RootDir), Some(Component::Prefix(_)))
+        | (Some(Component::Prefix(_)), Some(Component::RootDir)) => return None,
+        _ => {}
+    }
+
+    let common_prefix_len = path_components
+        .iter()
+        .zip(base_components.iter())
+        .take_while(|(left, right)| left == right)
+        .count();
+
+    let mut relative = PathBuf::new();
+    for _ in common_prefix_len..base_components.len() {
+        relative.push("..");
+    }
+    for component in &path_components[common_prefix_len..] {
+        relative.push(component.as_os_str());
+    }
+
+    if relative.as_os_str().is_empty() {
+        Some(PathBuf::from("."))
+    } else {
+        Some(relative)
+    }
 }
 
 fn make_patch(original: &str, updated: &str) -> Vec<StructuredPatchHunk> {
