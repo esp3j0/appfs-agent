@@ -2019,6 +2019,7 @@ fn powershell_branch_divergence_output(
             missing_fixes,
         ),
         interrupted: false,
+        raw_output_path: None,
         return_code_interpretation: Some("preflight_blocked:branch_divergence".to_string()),
         is_image: None,
         persisted_output_path: None,
@@ -2327,6 +2328,8 @@ struct PowerShellCommandOutput {
     stdout: String,
     stderr: String,
     interrupted: bool,
+    #[serde(rename = "rawOutputPath", skip_serializing_if = "Option::is_none")]
+    raw_output_path: Option<String>,
     #[serde(
         rename = "returnCodeInterpretation",
         skip_serializing_if = "Option::is_none"
@@ -4260,10 +4263,12 @@ impl From<BashCommandOutput> for NormalizedShellToolResult {
 
 impl From<PowerShellCommandOutput> for NormalizedShellToolResult {
     fn from(value: PowerShellCommandOutput) -> Self {
-        let background_output_path = value
-            .background_task_id
-            .as_deref()
-            .and_then(derive_background_output_path);
+        let background_output_path = value.raw_output_path.clone().or_else(|| {
+            value
+                .background_task_id
+                .as_deref()
+                .and_then(derive_background_output_path)
+        });
         Self {
             stdout: value.stdout,
             stderr: value.stderr,
@@ -4280,6 +4285,8 @@ impl From<PowerShellCommandOutput> for NormalizedShellToolResult {
 }
 
 fn derive_background_output_path(task_id: &str) -> Option<String> {
+    // Older transcripts may only persist backgroundTaskId, so keep a
+    // session-aware fallback for replay/resume when rawOutputPath is absent.
     let cwd = std::env::current_dir().ok()?;
     Some(
         shell_task_output_path(&cwd, task_id)
@@ -5853,6 +5860,7 @@ fn execute_shell_command(
             stdout: String::new(),
             stderr: String::new(),
             interrupted: false,
+            raw_output_path: Some(background_output.output_path),
             is_image: None,
             background_task_id: Some(background_output.task_id),
             backgrounded_by_user: None,
@@ -5891,6 +5899,7 @@ fn execute_shell_command(
                     stdout: prepared_output.stdout,
                     stderr: prepared_output.stderr,
                     interrupted: false,
+                    raw_output_path: None,
                     is_image: None,
                     background_task_id: None,
                     backgrounded_by_user: None,
@@ -5927,6 +5936,7 @@ Command exceeded timeout of {timeout_ms} ms",
                     stdout: prepared_output.stdout,
                     stderr: prepared_output.stderr,
                     interrupted: true,
+                    raw_output_path: None,
                     is_image: None,
                     background_task_id: None,
                     backgrounded_by_user: None,
@@ -5948,6 +5958,7 @@ Command exceeded timeout of {timeout_ms} ms",
         stdout: prepared_output.stdout,
         stderr: prepared_output.stderr,
         interrupted: false,
+        raw_output_path: None,
         is_image: None,
         background_task_id: None,
         backgrounded_by_user: None,
@@ -6107,6 +6118,7 @@ mod tests {
             stdout: stdout.to_string(),
             stderr: stderr.to_string(),
             interrupted,
+            raw_output_path: None,
             return_code_interpretation: None,
             is_image: None,
             persisted_output_path: None,
@@ -6255,22 +6267,30 @@ mod tests {
     }
 
     #[test]
-    fn model_visible_tool_result_derives_powershell_background_output_path_from_task_id() {
+    fn model_visible_tool_result_uses_powershell_raw_output_path_when_present() {
         let mut output = powershell_output("", "", false);
         output.background_task_id = Some("b1234xyz".to_string());
+        output.raw_output_path = Some(
+            "C:\\repo\\.claw\\sessions\\8f86a4368751b5ad\\session-1776656373469-0\\tasks\\b1234xyz.output"
+                .to_string(),
+        );
 
         let result = shell_model_result(&output, "PowerShell");
-        let expected_path = super::derive_background_output_path("b1234xyz")
-            .expect("background output path should resolve");
 
         let ToolResultContentBlock::Text { text } = &result.content[0] else {
             panic!("expected text block");
         };
-        assert_eq!(
-            text.as_str(),
-            format!(
-                "Command running in background with ID: b1234xyz. Output is being written to: {expected_path}"
-            )
+        assert!(
+            text.starts_with(
+                "Command running in background with ID: b1234xyz. Output is being written to: "
+            ),
+            "unexpected background message: {text}"
+        );
+        assert!(
+            text.ends_with(
+                "C:\\repo\\.claw\\sessions\\8f86a4368751b5ad\\session-1776656373469-0\\tasks\\b1234xyz.output"
+            ),
+            "unexpected background message: {text}"
         );
         assert!(!result.is_error);
     }
@@ -6280,10 +6300,12 @@ mod tests {
         let mut output = powershell_output("", "", false);
         output.background_task_id = Some("babc1234".to_string());
         output.assistant_auto_backgrounded = Some(true);
+        output.raw_output_path = Some(
+            "C:\\repo\\.claw\\sessions\\8f86a4368751b5ad\\session-1776656373469-0\\tasks\\babc1234.output"
+                .to_string(),
+        );
 
         let result = shell_model_result(&output, "PowerShell");
-        let expected_path = super::derive_background_output_path("babc1234")
-            .expect("background output path should resolve");
 
         let ToolResultContentBlock::Text { text } = &result.content[0] else {
             panic!("expected text block");
@@ -6292,7 +6314,9 @@ mod tests {
             "Command exceeded the assistant-mode blocking budget (15s) and was moved to the background with ID: babc1234."
         ));
         assert!(text.contains("It is still running - you will be notified when it completes."));
-        assert!(text.contains(&format!("Output is being written to: {expected_path}.")));
+        assert!(text.contains(
+            "Output is being written to: C:\\repo\\.claw\\sessions\\8f86a4368751b5ad\\session-1776656373469-0\\tasks\\babc1234.output."
+        ));
         assert!(text.contains(
             "In assistant mode, delegate long-running work to a subagent or use run_in_background to keep this conversation responsive."
         ));
@@ -8654,22 +8678,22 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = temp_path("fs-suite");
         fs::create_dir_all(&root).expect("create root");
-        let original_dir = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&root).expect("set cwd");
+        let demo_path = root.join("nested/demo.txt");
+        let demo_path_string = demo_path.to_string_lossy().into_owned();
 
         let write_create = execute_tool(
             "write_file",
-            &json!({ "path": "nested/demo.txt", "content": "alpha\nbeta\nalpha\n" }),
+            &json!({ "path": demo_path_string.as_str(), "content": "alpha\nbeta\nalpha\n" }),
         )
         .expect("write create should succeed");
         let write_create_output: serde_json::Value =
             serde_json::from_str(&write_create).expect("json");
         assert_eq!(write_create_output["type"], "create");
-        assert!(root.join("nested/demo.txt").exists());
+        assert!(demo_path.exists());
 
         let write_update = execute_tool(
             "write_file",
-            &json!({ "path": "nested/demo.txt", "content": "alpha\nbeta\ngamma\n" }),
+            &json!({ "path": demo_path_string.as_str(), "content": "alpha\nbeta\ngamma\n" }),
         )
         .expect("write update should succeed");
         let write_update_output: serde_json::Value =
@@ -8677,7 +8701,7 @@ mod tests {
         assert_eq!(write_update_output["type"], "update");
         assert_eq!(write_update_output["originalFile"], "alpha\nbeta\nalpha\n");
 
-        let read_full = execute_tool("read_file", &json!({ "path": "nested/demo.txt" }))
+        let read_full = execute_tool("read_file", &json!({ "path": demo_path_string.as_str() }))
             .expect("read full should succeed");
         let read_full_output: serde_json::Value = serde_json::from_str(&read_full).expect("json");
         assert_eq!(read_full_output["file"]["content"], "alpha\nbeta\ngamma");
@@ -8685,7 +8709,7 @@ mod tests {
 
         let read_slice = execute_tool(
             "read_file",
-            &json!({ "path": "nested/demo.txt", "offset": 1, "limit": 1 }),
+            &json!({ "path": demo_path_string.as_str(), "offset": 1, "limit": 1 }),
         )
         .expect("read slice should succeed");
         let read_slice_output: serde_json::Value = serde_json::from_str(&read_slice).expect("json");
@@ -8694,7 +8718,7 @@ mod tests {
 
         let read_past_end = execute_tool(
             "read_file",
-            &json!({ "path": "nested/demo.txt", "offset": 50 }),
+            &json!({ "path": demo_path_string.as_str(), "offset": 50 }),
         )
         .expect("read past EOF should succeed");
         let read_past_end_output: serde_json::Value =
@@ -8708,25 +8732,25 @@ mod tests {
 
         let edit_once = execute_tool(
             "edit_file",
-            &json!({ "path": "nested/demo.txt", "old_string": "alpha", "new_string": "omega" }),
+            &json!({ "path": demo_path_string.as_str(), "old_string": "alpha", "new_string": "omega" }),
         )
         .expect("single edit should succeed");
         let edit_once_output: serde_json::Value = serde_json::from_str(&edit_once).expect("json");
         assert_eq!(edit_once_output["replaceAll"], false);
         assert_eq!(
-            fs::read_to_string(root.join("nested/demo.txt")).expect("read file"),
+            fs::read_to_string(&demo_path).expect("read file"),
             "omega\nbeta\ngamma\n"
         );
 
         execute_tool(
             "write_file",
-            &json!({ "path": "nested/demo.txt", "content": "alpha\nbeta\nalpha\n" }),
+            &json!({ "path": demo_path_string.as_str(), "content": "alpha\nbeta\nalpha\n" }),
         )
         .expect("reset file");
         let edit_all = execute_tool(
             "edit_file",
             &json!({
-                "path": "nested/demo.txt",
+                "path": demo_path_string.as_str(),
                 "old_string": "alpha",
                 "new_string": "omega",
                 "replace_all": true
@@ -8736,25 +8760,24 @@ mod tests {
         let edit_all_output: serde_json::Value = serde_json::from_str(&edit_all).expect("json");
         assert_eq!(edit_all_output["replaceAll"], true);
         assert_eq!(
-            fs::read_to_string(root.join("nested/demo.txt")).expect("read file"),
+            fs::read_to_string(&demo_path).expect("read file"),
             "omega\nbeta\nomega\n"
         );
 
         let edit_same = execute_tool(
             "edit_file",
-            &json!({ "path": "nested/demo.txt", "old_string": "omega", "new_string": "omega" }),
+            &json!({ "path": demo_path_string.as_str(), "old_string": "omega", "new_string": "omega" }),
         )
         .expect_err("identical old/new should fail");
         assert!(edit_same.contains("must differ"));
 
         let edit_missing = execute_tool(
             "edit_file",
-            &json!({ "path": "nested/demo.txt", "old_string": "missing", "new_string": "omega" }),
+            &json!({ "path": demo_path_string.as_str(), "old_string": "missing", "new_string": "omega" }),
         )
         .expect_err("missing substring should fail");
         assert!(edit_missing.contains("old_string not found"));
 
-        std::env::set_current_dir(&original_dir).expect("restore cwd");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -9238,7 +9261,7 @@ printf 'pwsh:%s' "$1"
 
         let background_output: serde_json::Value = serde_json::from_str(&background).expect("json");
         assert!(background_output["backgroundTaskId"].as_str().is_some());
-        assert!(background_output.get("rawOutputPath").is_none());
+        assert!(background_output["rawOutputPath"].as_str().is_some());
         assert!(background_output.get("noOutputExpected").is_none());
         assert!(background_output["backgroundedByUser"].is_null());
         assert!(background_output["assistantAutoBackgrounded"].is_null());
