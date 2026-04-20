@@ -82,6 +82,35 @@ fn global_file_tool_states() -> &'static Mutex<GlobalStateMap> {
     STATES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn clean_state_path(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let text = path.to_string_lossy();
+        if let Some(stripped) = text.strip_prefix(r"\\?\") {
+            return PathBuf::from(stripped);
+        }
+    }
+
+    path
+}
+
+fn normalize_state_path(path: &Path) -> PathBuf {
+    if let Ok(canonical) = path.canonicalize() {
+        return clean_state_path(canonical);
+    }
+
+    if let Some(parent) = path.parent() {
+        let canonical_parent = parent
+            .canonicalize()
+            .map_or_else(|_| clean_state_path(parent.to_path_buf()), clean_state_path);
+        if let Some(name) = path.file_name() {
+            return clean_state_path(canonical_parent.join(name));
+        }
+    }
+
+    clean_state_path(path.to_path_buf())
+}
+
 fn file_tool_context_root() -> Result<PathBuf, String> {
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
     let session_root = tool_output_root(&cwd);
@@ -106,12 +135,14 @@ fn with_context_state_map<R>(action: impl FnOnce(&mut ContextStateMap) -> R) -> 
 }
 
 fn get_state_for_path(path: &Path) -> Result<Option<FileToolState>, String> {
-    with_context_state_map(|states| states.get(path).cloned())
+    let normalized_path = normalize_state_path(path);
+    with_context_state_map(|states| states.get(&normalized_path).cloned())
 }
 
 fn set_state_for_path(path: &Path, state: FileToolState) -> Result<(), String> {
+    let normalized_path = normalize_state_path(path);
     with_context_state_map(|states| {
-        states.insert(path.to_path_buf(), state);
+        states.insert(normalized_path, state);
     })
 }
 
