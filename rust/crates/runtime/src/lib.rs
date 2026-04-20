@@ -40,6 +40,7 @@ pub mod summary_compression;
 pub mod task_packet;
 pub mod task_registry;
 pub mod team_cron_registry;
+mod tool_session;
 #[cfg(test)]
 mod trust_resolver;
 mod usage;
@@ -52,7 +53,11 @@ pub use appfs::{
     AppfsRuntimeManifestControlPlane, APPFS_MULTI_AGENT_MODE_SHARED,
     APPFS_RUNTIME_MANIFEST_REL_PATH,
 };
-pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
+pub use bash::{
+    execute_bash, prepare_background_shell_output, prepare_shell_command_output,
+    shell_task_output_path, BackgroundShellOutputCapture, BashCommandInput, BashCommandOutput,
+    PreparedShellCommandOutput,
+};
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use branch_lock::{detect_branch_lock_collisions, BranchLockCollision, BranchLockIntent};
 pub use compact::{

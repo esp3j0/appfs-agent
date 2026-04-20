@@ -17,7 +17,8 @@ use runtime::{
     lsp_client::LspRegistry,
     mcp_tool_bridge::McpToolRegistry,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
-    read_file,
+    prepare_background_shell_output, prepare_shell_command_output, read_file,
+    shell_task_output_path,
     summary_compression::compress_summary_text,
     task_registry::TaskRegistry,
     team_cron_registry::{CronRegistry, TeamRegistry},
@@ -1828,6 +1829,30 @@ fn run_bash(input: BashCommandInput) -> Result<String, String> {
 }
 
 fn workspace_test_branch_preflight(command: &str) -> Option<BashCommandOutput> {
+    let preflight = workspace_test_branch_preflight_details(command)?;
+    Some(branch_divergence_output(
+        command,
+        &preflight.branch,
+        &preflight.main_ref,
+        preflight.commits_behind,
+        preflight.commits_ahead,
+        &preflight.missing_fixes,
+    ))
+}
+
+fn powershell_test_branch_preflight(command: &str) -> Option<PowerShellCommandOutput> {
+    let preflight = workspace_test_branch_preflight_details(command)?;
+    Some(powershell_branch_divergence_output(
+        command,
+        &preflight.branch,
+        &preflight.main_ref,
+        preflight.commits_behind,
+        preflight.commits_ahead,
+        &preflight.missing_fixes,
+    ))
+}
+
+fn workspace_test_branch_preflight_details(command: &str) -> Option<BranchDivergencePreflight> {
     if !is_workspace_test_command(command) {
         return None;
     }
@@ -1840,27 +1865,33 @@ fn workspace_test_branch_preflight(command: &str) -> Option<BashCommandOutput> {
         BranchFreshness::Stale {
             commits_behind,
             missing_fixes,
-        } => Some(branch_divergence_output(
-            command,
-            &branch,
-            &main_ref,
+        } => Some(BranchDivergencePreflight {
+            branch,
+            main_ref,
             commits_behind,
-            None,
-            &missing_fixes,
-        )),
+            commits_ahead: None,
+            missing_fixes,
+        }),
         BranchFreshness::Diverged {
             ahead,
             behind,
             missing_fixes,
-        } => Some(branch_divergence_output(
-            command,
-            &branch,
-            &main_ref,
-            behind,
-            Some(ahead),
-            &missing_fixes,
-        )),
+        } => Some(BranchDivergencePreflight {
+            branch,
+            main_ref,
+            commits_behind: behind,
+            commits_ahead: Some(ahead),
+            missing_fixes,
+        }),
     }
+}
+
+struct BranchDivergencePreflight {
+    branch: String,
+    main_ref: String,
+    commits_behind: usize,
+    commits_ahead: Option<usize>,
+    missing_fixes: Vec<String>,
 }
 
 fn is_workspace_test_command(command: &str) -> bool {
@@ -1923,17 +1954,13 @@ fn branch_divergence_output(
     commits_ahead: Option<usize>,
     missing_fixes: &[String],
 ) -> BashCommandOutput {
-    let relation = commits_ahead.map_or_else(
-        || format!("is {commits_behind} commit(s) behind"),
-        |ahead| format!("has diverged ({ahead} ahead, {commits_behind} behind)"),
-    );
-    let missing_summary = if missing_fixes.is_empty() {
-        "(none surfaced)".to_string()
-    } else {
-        missing_fixes.join("; ")
-    };
-    let stderr = format!(
-        "branch divergence detected before workspace tests: `{branch}` {relation} `{main_ref}`. Missing commits: {missing_summary}. Merge or rebase `{main_ref}` before re-running `{command}`."
+    let stderr = branch_divergence_stderr(
+        command,
+        branch,
+        main_ref,
+        commits_behind,
+        commits_ahead,
+        missing_fixes,
     );
 
     BashCommandOutput {
@@ -1971,6 +1998,58 @@ fn branch_divergence_output(
         persisted_output_size: None,
         sandbox_status: None,
     }
+}
+
+fn powershell_branch_divergence_output(
+    command: &str,
+    branch: &str,
+    main_ref: &str,
+    commits_behind: usize,
+    commits_ahead: Option<usize>,
+    missing_fixes: &[String],
+) -> PowerShellCommandOutput {
+    PowerShellCommandOutput {
+        stdout: String::new(),
+        stderr: branch_divergence_stderr(
+            command,
+            branch,
+            main_ref,
+            commits_behind,
+            commits_ahead,
+            missing_fixes,
+        ),
+        interrupted: false,
+        return_code_interpretation: Some("preflight_blocked:branch_divergence".to_string()),
+        is_image: None,
+        persisted_output_path: None,
+        persisted_output_size: None,
+        background_task_id: None,
+        backgrounded_by_user: None,
+        assistant_auto_backgrounded: None,
+        structured_content: None,
+    }
+}
+
+fn branch_divergence_stderr(
+    command: &str,
+    branch: &str,
+    main_ref: &str,
+    commits_behind: usize,
+    commits_ahead: Option<usize>,
+    missing_fixes: &[String],
+) -> String {
+    let relation = commits_ahead.map_or_else(
+        || format!("is {commits_behind} commit(s) behind"),
+        |ahead| format!("has diverged ({ahead} ahead, {commits_behind} behind)"),
+    );
+    let missing_summary = if missing_fixes.is_empty() {
+        "(none surfaced)".to_string()
+    } else {
+        missing_fixes.join("; ")
+    };
+    format!(
+        "branch divergence detected before workspace tests: `{branch}` {relation} `{main_ref}`. Missing commits: {missing_summary}. Merge or rebase `{main_ref}` before re-running `{command}`."
+    )
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -2241,6 +2320,41 @@ struct PowerShellInput {
     timeout: Option<u64>,
     description: Option<String>,
     run_in_background: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct PowerShellCommandOutput {
+    stdout: String,
+    stderr: String,
+    interrupted: bool,
+    #[serde(
+        rename = "returnCodeInterpretation",
+        skip_serializing_if = "Option::is_none"
+    )]
+    return_code_interpretation: Option<String>,
+    #[serde(rename = "isImage", skip_serializing_if = "Option::is_none")]
+    is_image: Option<bool>,
+    #[serde(
+        rename = "persistedOutputPath",
+        skip_serializing_if = "Option::is_none"
+    )]
+    persisted_output_path: Option<String>,
+    #[serde(
+        rename = "persistedOutputSize",
+        skip_serializing_if = "Option::is_none"
+    )]
+    persisted_output_size: Option<u64>,
+    #[serde(rename = "backgroundTaskId", skip_serializing_if = "Option::is_none")]
+    background_task_id: Option<String>,
+    #[serde(rename = "backgroundedByUser", skip_serializing_if = "Option::is_none")]
+    backgrounded_by_user: Option<bool>,
+    #[serde(
+        rename = "assistantAutoBackgrounded",
+        skip_serializing_if = "Option::is_none"
+    )]
+    assistant_auto_backgrounded: Option<bool>,
+    #[serde(rename = "structuredContent", skip_serializing_if = "Option::is_none")]
+    structured_content: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4066,6 +4180,407 @@ fn tool_specs_for_allowed_tools(allowed_tools: Option<&BTreeSet<String>>) -> Vec
         .collect()
 }
 
+const PERSISTED_OUTPUT_TAG: &str = "<persisted-output>";
+const PERSISTED_OUTPUT_CLOSING_TAG: &str = "</persisted-output>";
+const PERSISTED_OUTPUT_PREVIEW_BYTES: usize = 2_000;
+const INTERRUPTED_COMMAND_TAG: &str = "<error>Command was aborted before completion</error>";
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelVisibleToolResult {
+    pub content: Vec<ToolResultContentBlock>,
+    pub is_error: bool,
+}
+
+impl ModelVisibleToolResult {
+    fn raw_text(output: &str, is_error: bool) -> Self {
+        Self {
+            content: vec![ToolResultContentBlock::Text {
+                text: output.to_string(),
+            }],
+            is_error,
+        }
+    }
+}
+
+#[must_use]
+pub fn model_visible_tool_result(
+    tool_name: &str,
+    output: &str,
+    is_error: bool,
+) -> ModelVisibleToolResult {
+    if !matches!(tool_name, "bash" | "PowerShell") {
+        return ModelVisibleToolResult::raw_text(output, is_error);
+    }
+
+    let Some((shell_output, trailing_text)) = parse_shell_tool_result(tool_name, output) else {
+        return ModelVisibleToolResult::raw_text(output, is_error);
+    };
+
+    let mut result = shell_tool_result_to_model_visible_result(&shell_output, is_error);
+    append_trailing_tool_text(&mut result.content, trailing_text);
+    result
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct NormalizedShellToolResult {
+    stdout: String,
+    stderr: String,
+    interrupted: bool,
+    structured_content: Option<Vec<Value>>,
+    persisted_output_path: Option<String>,
+    persisted_output_size: Option<u64>,
+    background_task_id: Option<String>,
+    backgrounded_by_user: Option<bool>,
+    assistant_auto_backgrounded: Option<bool>,
+    background_output_path: Option<String>,
+}
+
+impl From<BashCommandOutput> for NormalizedShellToolResult {
+    fn from(value: BashCommandOutput) -> Self {
+        let background_output_path = value.raw_output_path.clone().or_else(|| {
+            value
+                .background_task_id
+                .as_deref()
+                .and_then(derive_background_output_path)
+        });
+        Self {
+            stdout: value.stdout,
+            stderr: value.stderr,
+            interrupted: value.interrupted,
+            structured_content: value.structured_content,
+            persisted_output_path: value.persisted_output_path,
+            persisted_output_size: value.persisted_output_size,
+            background_task_id: value.background_task_id,
+            backgrounded_by_user: value.backgrounded_by_user,
+            assistant_auto_backgrounded: value.assistant_auto_backgrounded,
+            background_output_path,
+        }
+    }
+}
+
+impl From<PowerShellCommandOutput> for NormalizedShellToolResult {
+    fn from(value: PowerShellCommandOutput) -> Self {
+        let background_output_path = value
+            .background_task_id
+            .as_deref()
+            .and_then(derive_background_output_path);
+        Self {
+            stdout: value.stdout,
+            stderr: value.stderr,
+            interrupted: value.interrupted,
+            structured_content: value.structured_content,
+            persisted_output_path: value.persisted_output_path,
+            persisted_output_size: value.persisted_output_size,
+            background_task_id: value.background_task_id,
+            backgrounded_by_user: value.backgrounded_by_user,
+            assistant_auto_backgrounded: value.assistant_auto_backgrounded,
+            background_output_path,
+        }
+    }
+}
+
+fn derive_background_output_path(task_id: &str) -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    Some(
+        shell_task_output_path(&cwd, task_id)
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+fn parse_shell_tool_result<'a>(
+    tool_name: &str,
+    output: &'a str,
+) -> Option<(NormalizedShellToolResult, &'a str)> {
+    if let Some(parsed) = parse_shell_tool_result_json(tool_name, output) {
+        return Some((parsed, ""));
+    }
+
+    let (json_prefix, trailing_text) = split_json_prefix(output)?;
+    let parsed = parse_shell_tool_result_json(tool_name, json_prefix)?;
+    Some((parsed, trailing_text))
+}
+
+fn parse_shell_tool_result_json(
+    tool_name: &str,
+    output: &str,
+) -> Option<NormalizedShellToolResult> {
+    match tool_name {
+        "bash" => serde_json::from_str::<BashCommandOutput>(output)
+            .ok()
+            .map(NormalizedShellToolResult::from),
+        "PowerShell" => serde_json::from_str::<PowerShellCommandOutput>(output)
+            .ok()
+            .map(NormalizedShellToolResult::from),
+        _ => None,
+    }
+}
+
+fn split_json_prefix(input: &str) -> Option<(&str, &str)> {
+    let start = input.find(|ch: char| !ch.is_whitespace())?;
+    let mut stack = Vec::new();
+    let mut in_string = false;
+    let mut escape = false;
+    let mut end = None;
+
+    for (offset, ch) in input[start..].char_indices() {
+        if offset == 0 {
+            match ch {
+                '{' => stack.push('}'),
+                '[' => stack.push(']'),
+                _ => return None,
+            }
+            continue;
+        }
+
+        if in_string {
+            if escape {
+                escape = false;
+                continue;
+            }
+            match ch {
+                '\\' => escape = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => stack.push('}'),
+            '[' => stack.push(']'),
+            '}' | ']' => {
+                if stack.pop() != Some(ch) {
+                    return None;
+                }
+                if stack.is_empty() {
+                    end = Some(start + offset + ch.len_utf8());
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let end = end?;
+    Some((&input[start..end], &input[end..]))
+}
+
+fn shell_tool_result_to_model_visible_result(
+    output: &NormalizedShellToolResult,
+    is_error: bool,
+) -> ModelVisibleToolResult {
+    if let Some(structured_content) = output
+        .structured_content
+        .as_ref()
+        .filter(|content| !content.is_empty())
+    {
+        return ModelVisibleToolResult {
+            content: structured_content
+                .iter()
+                .map(tool_result_content_block_from_value)
+                .collect(),
+            is_error: is_error || output.interrupted,
+        };
+    }
+
+    let mut sections = Vec::new();
+    let mut processed_stdout = normalize_shell_stdout(&output.stdout);
+    if let Some(path) = output.persisted_output_path.as_deref() {
+        let (preview, has_more) =
+            generate_tool_result_preview(&processed_stdout, PERSISTED_OUTPUT_PREVIEW_BYTES);
+        processed_stdout = build_large_tool_result_message(
+            path,
+            output.persisted_output_size.unwrap_or(0),
+            &preview,
+            has_more,
+        );
+    }
+    if !processed_stdout.is_empty() {
+        sections.push(processed_stdout);
+    }
+
+    let mut error_message = output.stderr.trim().to_string();
+    if output.interrupted {
+        if !error_message.is_empty() {
+            error_message.push('\n');
+        }
+        error_message.push_str(INTERRUPTED_COMMAND_TAG);
+    }
+    if !error_message.is_empty() {
+        sections.push(error_message);
+    }
+
+    if let Some(background_info) = build_background_info(output) {
+        sections.push(background_info);
+    }
+
+    ModelVisibleToolResult {
+        content: vec![ToolResultContentBlock::Text {
+            text: sections.join("\n"),
+        }],
+        is_error: is_error || output.interrupted,
+    }
+}
+
+fn tool_result_content_block_from_value(value: &Value) -> ToolResultContentBlock {
+    match value {
+        Value::String(text) => ToolResultContentBlock::Text { text: text.clone() },
+        _ => ToolResultContentBlock::Json {
+            value: value.clone(),
+        },
+    }
+}
+
+fn normalize_shell_stdout(stdout: &str) -> String {
+    strip_leading_blank_lines(stdout).trim_end().to_string()
+}
+
+fn strip_leading_blank_lines(mut text: &str) -> &str {
+    while let Some(newline_idx) = text.find('\n') {
+        let (line, rest) = text.split_at(newline_idx + 1);
+        if line.trim().is_empty() {
+            text = rest;
+        } else {
+            return text;
+        }
+    }
+
+    if text.trim().is_empty() {
+        ""
+    } else {
+        text
+    }
+}
+
+fn generate_tool_result_preview(content: &str, max_bytes: usize) -> (String, bool) {
+    if content.len() <= max_bytes {
+        return (content.to_string(), false);
+    }
+
+    let mut cut_point = max_bytes.min(content.len());
+    while cut_point > 0 && !content.is_char_boundary(cut_point) {
+        cut_point -= 1;
+    }
+
+    let truncated = &content[..cut_point];
+    let final_cut = truncated
+        .rfind('\n')
+        .filter(|idx| *idx > cut_point / 2)
+        .unwrap_or(cut_point);
+
+    (content[..final_cut].to_string(), true)
+}
+
+fn build_large_tool_result_message(
+    filepath: &str,
+    original_size: u64,
+    preview: &str,
+    has_more: bool,
+) -> String {
+    let mut message = format!(
+        "{PERSISTED_OUTPUT_TAG}\nOutput too large ({}). Full output saved to: {filepath}\n\nPreview (first {}):\n{preview}",
+        format_file_size(original_size),
+        format_file_size(PERSISTED_OUTPUT_PREVIEW_BYTES as u64),
+    );
+    if has_more {
+        message.push_str("\n...\n");
+    } else {
+        message.push('\n');
+    }
+    message.push_str(PERSISTED_OUTPUT_CLOSING_TAG);
+    message
+}
+
+fn format_file_size(size_in_bytes: u64) -> String {
+    if size_in_bytes < 1_024 {
+        return format!("{size_in_bytes} bytes");
+    }
+
+    let kb_tenths = scale_to_tenths(u128::from(size_in_bytes), 1_024);
+    if kb_tenths < 10 * 1_024 {
+        return format!("{}KB", format_size_unit(kb_tenths));
+    }
+
+    let mb_tenths = scale_to_tenths(u128::from(size_in_bytes), 1_024 * 1_024);
+    if mb_tenths < 10 * 1_024 {
+        return format!("{}MB", format_size_unit(mb_tenths));
+    }
+
+    let gb_tenths = scale_to_tenths(u128::from(size_in_bytes), 1_024 * 1_024 * 1_024);
+    format!("{}GB", format_size_unit(gb_tenths))
+}
+
+fn scale_to_tenths(size_in_bytes: u128, unit_size: u128) -> u128 {
+    ((size_in_bytes * 10) + (unit_size / 2)) / unit_size
+}
+
+fn format_size_unit(size_in_tenths: u128) -> String {
+    let whole = size_in_tenths / 10;
+    let fraction = size_in_tenths % 10;
+    if fraction == 0 {
+        whole.to_string()
+    } else {
+        format!("{whole}.{fraction}")
+    }
+}
+
+fn build_background_info(output: &NormalizedShellToolResult) -> Option<String> {
+    let task_id = output.background_task_id.as_deref()?;
+    let output_path = output.background_output_path.as_deref();
+
+    let message = if output.assistant_auto_backgrounded.unwrap_or(false) {
+        match output_path {
+            Some(path) => format!(
+                "Command exceeded the assistant-mode blocking budget (15s) and was moved to the background with ID: {task_id}. It is still running - you will be notified when it completes. Output is being written to: {path}. In assistant mode, delegate long-running work to a subagent or use run_in_background to keep this conversation responsive."
+            ),
+            None => format!(
+                "Command exceeded the assistant-mode blocking budget (15s) and was moved to the background with ID: {task_id}. It is still running - you will be notified when it completes. In assistant mode, delegate long-running work to a subagent or use run_in_background to keep this conversation responsive."
+            ),
+        }
+    } else if output.backgrounded_by_user.unwrap_or(false) {
+        match output_path {
+            Some(path) => {
+                format!(
+                    "Command was manually backgrounded by user with ID: {task_id}. Output is being written to: {path}"
+                )
+            }
+            None => format!("Command was manually backgrounded by user with ID: {task_id}"),
+        }
+    } else {
+        match output_path {
+            Some(path) => {
+                format!("Command running in background with ID: {task_id}. Output is being written to: {path}")
+            }
+            None => format!("Command running in background with ID: {task_id}"),
+        }
+    };
+
+    Some(message)
+}
+
+fn append_trailing_tool_text(content: &mut Vec<ToolResultContentBlock>, trailing_text: &str) {
+    let trimmed = trailing_text.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+
+    if content.len() == 1 {
+        if let Some(ToolResultContentBlock::Text { text }) = content.first_mut() {
+            if !text.is_empty() {
+                text.push_str("\n\n");
+            }
+            text.push_str(trimmed);
+            return;
+        }
+    }
+
+    content.push(ToolResultContentBlock::Text {
+        text: trimmed.to_string(),
+    });
+}
+
 fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
     messages
         .iter()
@@ -4087,16 +4602,18 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                     },
                     ContentBlock::ToolResult {
                         tool_use_id,
+                        tool_name,
                         output,
                         is_error,
                         ..
-                    } => InputContentBlock::ToolResult {
-                        tool_use_id: tool_use_id.clone(),
-                        content: vec![ToolResultContentBlock::Text {
-                            text: output.clone(),
-                        }],
-                        is_error: *is_error,
-                    },
+                    } => {
+                        let result = model_visible_tool_result(tool_name, output, *is_error);
+                        InputContentBlock::ToolResult {
+                            tool_use_id: tool_use_id.clone(),
+                            content: result.content,
+                            is_error: result.is_error,
+                        }
+                    }
                 })
                 .collect::<Vec<_>>();
             (!content.is_empty()).then(|| InputMessage {
@@ -5222,9 +5739,9 @@ fn iso8601_timestamp() -> String {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn execute_powershell(input: PowerShellInput) -> std::io::Result<runtime::BashCommandOutput> {
+fn execute_powershell(input: PowerShellInput) -> std::io::Result<PowerShellCommandOutput> {
     let _ = &input.description;
-    if let Some(output) = workspace_test_branch_preflight(&input.command) {
+    if let Some(output) = powershell_test_branch_preflight(&input.command) {
         return Ok(output);
     }
     let shell = detect_powershell_shell()?;
@@ -5317,33 +5834,33 @@ fn execute_shell_command(
     command: &str,
     timeout: Option<u64>,
     run_in_background: Option<bool>,
-) -> std::io::Result<runtime::BashCommandOutput> {
+) -> std::io::Result<PowerShellCommandOutput> {
+    let cwd = std::env::current_dir()?;
+
     if run_in_background.unwrap_or(false) {
-        let child = std::process::Command::new(shell)
+        let background_output = prepare_background_shell_output(&cwd, "powershell")?;
+        std::process::Command::new(shell)
             .arg("-NoProfile")
             .arg("-NonInteractive")
             .arg("-Command")
             .arg(command)
+            .current_dir(&cwd)
             .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stdout(background_output.stdout)
+            .stderr(background_output.stderr)
             .spawn()?;
-        return Ok(runtime::BashCommandOutput {
+        return Ok(PowerShellCommandOutput {
             stdout: String::new(),
             stderr: String::new(),
-            raw_output_path: None,
             interrupted: false,
             is_image: None,
-            background_task_id: Some(child.id().to_string()),
-            backgrounded_by_user: Some(true),
-            assistant_auto_backgrounded: Some(false),
-            dangerously_disable_sandbox: None,
+            background_task_id: Some(background_output.task_id),
+            backgrounded_by_user: None,
+            assistant_auto_backgrounded: None,
             return_code_interpretation: None,
-            no_output_expected: Some(true),
-            structured_content: None,
             persisted_output_path: None,
             persisted_output_size: None,
-            sandbox_status: None,
+            structured_content: None,
         });
     }
 
@@ -5353,6 +5870,7 @@ fn execute_shell_command(
         .arg("-NonInteractive")
         .arg("-Command")
         .arg(command);
+    process.current_dir(&cwd);
     process
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -5363,25 +5881,27 @@ fn execute_shell_command(
         loop {
             if let Some(status) = child.try_wait()? {
                 let output = child.wait_with_output()?;
-                return Ok(runtime::BashCommandOutput {
-                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                    raw_output_path: None,
+                let prepared_output = prepare_shell_command_output(
+                    &cwd,
+                    "powershell",
+                    &output.stdout,
+                    &output.stderr,
+                );
+                return Ok(PowerShellCommandOutput {
+                    stdout: prepared_output.stdout,
+                    stderr: prepared_output.stderr,
                     interrupted: false,
                     is_image: None,
                     background_task_id: None,
                     backgrounded_by_user: None,
                     assistant_auto_backgrounded: None,
-                    dangerously_disable_sandbox: None,
                     return_code_interpretation: status
                         .code()
                         .filter(|code| *code != 0)
                         .map(|code| format!("exit_code:{code}")),
-                    no_output_expected: Some(output.stdout.is_empty() && output.stderr.is_empty()),
+                    persisted_output_path: prepared_output.persisted_output_path,
+                    persisted_output_size: prepared_output.persisted_output_size,
                     structured_content: None,
-                    persisted_output_path: None,
-                    persisted_output_size: None,
-                    sandbox_status: None,
                 });
             }
             if started.elapsed() >= Duration::from_millis(timeout_ms) {
@@ -5397,22 +5917,24 @@ Command exceeded timeout of {timeout_ms} ms",
                         stderr.trim_end()
                     )
                 };
-                return Ok(runtime::BashCommandOutput {
-                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                    stderr,
-                    raw_output_path: None,
+                let prepared_output = prepare_shell_command_output(
+                    &cwd,
+                    "powershell",
+                    &output.stdout,
+                    stderr.as_bytes(),
+                );
+                return Ok(PowerShellCommandOutput {
+                    stdout: prepared_output.stdout,
+                    stderr: prepared_output.stderr,
                     interrupted: true,
                     is_image: None,
                     background_task_id: None,
                     backgrounded_by_user: None,
                     assistant_auto_backgrounded: None,
-                    dangerously_disable_sandbox: None,
                     return_code_interpretation: Some(String::from("timeout")),
-                    no_output_expected: Some(false),
+                    persisted_output_path: prepared_output.persisted_output_path,
+                    persisted_output_size: prepared_output.persisted_output_size,
                     structured_content: None,
-                    persisted_output_path: None,
-                    persisted_output_size: None,
-                    sandbox_status: None,
                 });
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -5420,26 +5942,24 @@ Command exceeded timeout of {timeout_ms} ms",
     }
 
     let output = process.output()?;
-    Ok(runtime::BashCommandOutput {
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        raw_output_path: None,
+    let prepared_output =
+        prepare_shell_command_output(&cwd, "powershell", &output.stdout, &output.stderr);
+    Ok(PowerShellCommandOutput {
+        stdout: prepared_output.stdout,
+        stderr: prepared_output.stderr,
         interrupted: false,
         is_image: None,
         background_task_id: None,
         backgrounded_by_user: None,
         assistant_auto_backgrounded: None,
-        dangerously_disable_sandbox: None,
         return_code_interpretation: output
             .status
             .code()
             .filter(|code| *code != 0)
             .map(|code| format!("exit_code:{code}")),
-        no_output_expected: Some(output.stdout.is_empty() && output.stderr.is_empty()),
+        persisted_output_path: prepared_output.persisted_output_path,
+        persisted_output_size: prepared_output.persisted_output_size,
         structured_content: None,
-        persisted_output_path: None,
-        persisted_output_size: None,
-        sandbox_status: None,
     })
 }
 
@@ -5519,16 +6039,18 @@ mod tests {
     use super::{
         agent_permission_policy, allowed_tools_for_subagent, classify_lane_failure,
         derive_agent_state, execute_agent_with_spawn, execute_tool, final_assistant_text,
-        maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
-        persist_agent_terminal_state, push_output_block, run_task_packet, AgentInput, AgentJob,
-        GlobalToolRegistry, LaneEventName, LaneFailureClass, ProviderRuntimeClient,
+        maybe_commit_provenance, model_visible_tool_result, mvp_tool_specs,
+        permission_mode_from_plugin, persist_agent_terminal_state, push_output_block,
+        run_task_packet, AgentInput, AgentJob, GlobalToolRegistry, LaneEventName, LaneFailureClass,
+        ModelVisibleToolResult, PowerShellCommandOutput, ProviderRuntimeClient,
         SubagentToolExecutor,
     };
-    use api::OutputContentBlock;
+    use api::{OutputContentBlock, ToolResultContentBlock};
     use runtime::ProviderFallbackConfig;
     use runtime::{
-        permission_enforcer::PermissionEnforcer, ApiRequest, AssistantEvent, ConversationRuntime,
-        PermissionMode, PermissionPolicy, RuntimeError, Session, TaskPacket, ToolExecutor,
+        permission_enforcer::PermissionEnforcer, ApiRequest, AssistantEvent, BashCommandOutput,
+        ConversationRuntime, PermissionMode, PermissionPolicy, RuntimeError, Session, TaskPacket,
+        ToolExecutor,
     };
     use serde_json::json;
 
@@ -5553,6 +6075,227 @@ mod tests {
         assert!(poisoned.is_err(), "poisoning thread should panic");
 
         let _guard = env_guard();
+    }
+
+    fn bash_output(
+        stdout: &str,
+        stderr: &str,
+        interrupted: bool,
+        structured_content: Option<Vec<serde_json::Value>>,
+    ) -> BashCommandOutput {
+        BashCommandOutput {
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+            raw_output_path: None,
+            interrupted,
+            is_image: None,
+            background_task_id: None,
+            backgrounded_by_user: None,
+            assistant_auto_backgrounded: None,
+            dangerously_disable_sandbox: None,
+            return_code_interpretation: None,
+            no_output_expected: None,
+            structured_content,
+            persisted_output_path: None,
+            persisted_output_size: None,
+            sandbox_status: None,
+        }
+    }
+
+    fn powershell_output(stdout: &str, stderr: &str, interrupted: bool) -> PowerShellCommandOutput {
+        PowerShellCommandOutput {
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+            interrupted,
+            return_code_interpretation: None,
+            is_image: None,
+            persisted_output_path: None,
+            persisted_output_size: None,
+            background_task_id: None,
+            backgrounded_by_user: None,
+            assistant_auto_backgrounded: None,
+            structured_content: None,
+        }
+    }
+
+    fn shell_model_result<T: serde::Serialize>(
+        output: &T,
+        tool_name: &str,
+    ) -> ModelVisibleToolResult {
+        let serialized = serde_json::to_string_pretty(output).expect("serialize shell output");
+        model_visible_tool_result(tool_name, &serialized, false)
+    }
+
+    #[test]
+    fn model_visible_tool_result_wraps_shell_stdout_and_stderr() {
+        let output = bash_output("\n\nhello\n", "warning\n", false, None);
+        let result = shell_model_result(&output, "bash");
+
+        assert_eq!(
+            result,
+            ModelVisibleToolResult {
+                content: vec![ToolResultContentBlock::Text {
+                    text: "hello\nwarning".to_string(),
+                }],
+                is_error: false,
+            }
+        );
+    }
+
+    #[test]
+    fn model_visible_tool_result_wraps_persisted_output_for_shell_tools() {
+        let mut output = bash_output("\npreview line\n", "", false, None);
+        output.persisted_output_path = Some("C:\\temp\\bash-output.txt".to_string());
+        output.persisted_output_size = Some(4_096);
+
+        let result = shell_model_result(&output, "PowerShell");
+
+        let ToolResultContentBlock::Text { text } = &result.content[0] else {
+            panic!("expected text block");
+        };
+        assert!(text.starts_with("<persisted-output>\n"));
+        assert!(text
+            .contains("Output too large (4KB). Full output saved to: C:\\temp\\bash-output.txt"));
+        assert!(text.contains("Preview (first 2KB):\npreview line\n</persisted-output>"));
+        assert!(!result.is_error);
+    }
+
+    #[test]
+    fn model_visible_tool_result_preserves_structured_content_blocks() {
+        let output = bash_output(
+            "",
+            "",
+            false,
+            Some(vec![json!("note"), json!({ "ok": true })]),
+        );
+        let result = shell_model_result(&output, "bash");
+
+        assert_eq!(
+            result,
+            ModelVisibleToolResult {
+                content: vec![
+                    ToolResultContentBlock::Text {
+                        text: "note".to_string(),
+                    },
+                    ToolResultContentBlock::Json {
+                        value: json!({ "ok": true }),
+                    },
+                ],
+                is_error: false,
+            }
+        );
+    }
+
+    #[test]
+    fn model_visible_tool_result_parses_shell_json_prefix_before_hook_feedback() {
+        let serialized = serde_json::to_string_pretty(&bash_output("hello\n", "", false, None))
+            .expect("serialize shell output");
+        let output = format!("{serialized}\n\nHook feedback:\nreview me");
+
+        let result = model_visible_tool_result("bash", &output, false);
+
+        assert_eq!(
+            result,
+            ModelVisibleToolResult {
+                content: vec![ToolResultContentBlock::Text {
+                    text: "hello\n\nHook feedback:\nreview me".to_string(),
+                }],
+                is_error: false,
+            }
+        );
+    }
+
+    #[test]
+    fn model_visible_tool_result_falls_back_to_raw_text_when_shell_output_is_not_json() {
+        let result = model_visible_tool_result("bash", "not json", true);
+
+        assert_eq!(
+            result,
+            ModelVisibleToolResult {
+                content: vec![ToolResultContentBlock::Text {
+                    text: "not json".to_string(),
+                }],
+                is_error: true,
+            }
+        );
+    }
+
+    #[test]
+    fn model_visible_tool_result_marks_interrupted_shell_output_as_error() {
+        let output = bash_output("partial", "timeout reached", true, None);
+        let result = shell_model_result(&output, "PowerShell");
+
+        let ToolResultContentBlock::Text { text } = &result.content[0] else {
+            panic!("expected text block");
+        };
+        assert!(text.contains("partial"));
+        assert!(text.contains("timeout reached"));
+        assert!(text.contains("<error>Command was aborted before completion</error>"));
+        assert!(result.is_error);
+    }
+
+    #[test]
+    fn model_visible_tool_result_uses_generic_background_message_for_explicit_backgrounding() {
+        let mut output = bash_output("", "", false, None);
+        output.background_task_id = Some("b1234xyz".to_string());
+        output.raw_output_path = Some(
+            "C:\\temp\\.claw\\sessions\\workspace\\session\\tasks\\b1234xyz.output".to_string(),
+        );
+
+        let result = shell_model_result(&output, "bash");
+
+        let ToolResultContentBlock::Text { text } = &result.content[0] else {
+            panic!("expected text block");
+        };
+        assert_eq!(
+            text,
+            "Command running in background with ID: b1234xyz. Output is being written to: C:\\temp\\.claw\\sessions\\workspace\\session\\tasks\\b1234xyz.output"
+        );
+        assert!(!result.is_error);
+    }
+
+    #[test]
+    fn model_visible_tool_result_derives_powershell_background_output_path_from_task_id() {
+        let mut output = powershell_output("", "", false);
+        output.background_task_id = Some("b1234xyz".to_string());
+
+        let result = shell_model_result(&output, "PowerShell");
+        let expected_path = super::derive_background_output_path("b1234xyz")
+            .expect("background output path should resolve");
+
+        let ToolResultContentBlock::Text { text } = &result.content[0] else {
+            panic!("expected text block");
+        };
+        assert_eq!(
+            text.as_str(),
+            format!(
+                "Command running in background with ID: b1234xyz. Output is being written to: {expected_path}"
+            )
+        );
+        assert!(!result.is_error);
+    }
+
+    #[test]
+    fn model_visible_tool_result_matches_ts_autobackground_message() {
+        let mut output = powershell_output("", "", false);
+        output.background_task_id = Some("babc1234".to_string());
+        output.assistant_auto_backgrounded = Some(true);
+
+        let result = shell_model_result(&output, "PowerShell");
+        let expected_path = super::derive_background_output_path("babc1234")
+            .expect("background output path should resolve");
+
+        let ToolResultContentBlock::Text { text } = &result.content[0] else {
+            panic!("expected text block");
+        };
+        assert!(text.contains(
+            "Command exceeded the assistant-mode blocking budget (15s) and was moved to the background with ID: babc1234."
+        ));
+        assert!(text.contains("It is still running - you will be notified when it completes."));
+        assert!(text.contains(&format!("Output is being written to: {expected_path}.")));
+        assert!(text.contains(
+            "In assistant mode, delegate long-running work to a subagent or use run_in_background to keep this conversation responsive."
+        ));
     }
 
     fn temp_path(name: &str) -> PathBuf {
@@ -7776,6 +8519,8 @@ mod tests {
         .expect("bash background should succeed");
         let background_output: serde_json::Value = serde_json::from_str(&background).expect("json");
         assert!(background_output["backgroundTaskId"].as_str().is_some());
+        assert!(background_output["rawOutputPath"].as_str().is_some());
+        assert!(background_output["backgroundedByUser"].is_null());
         assert_eq!(background_output["noOutputExpected"], true);
     }
 
@@ -7858,6 +8603,45 @@ mod tests {
             output_json["returnCodeInterpretation"],
             "preflight_blocked:branch_divergence"
         );
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn powershell_workspace_tests_are_blocked_without_structured_content() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("powershell-workspace-test-preflight");
+        let original_dir = std::env::current_dir().expect("cwd");
+        init_git_repo(&root);
+        run_git(&root, &["checkout", "-b", "feature/stale-powershell-tests"]);
+        run_git(&root, &["checkout", "main"]);
+        commit_file(
+            &root,
+            "hotfix.txt",
+            "fix from main\n",
+            "fix: unblock powershell workspace tests",
+        );
+        run_git(&root, &["checkout", "feature/stale-powershell-tests"]);
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let output = execute_tool(
+            "PowerShell",
+            &json!({ "command": "cargo test --workspace --all-targets" }),
+        )
+        .expect("preflight should return structured output");
+        let output_json: serde_json::Value = serde_json::from_str(&output).expect("json");
+        assert_eq!(
+            output_json["returnCodeInterpretation"],
+            "preflight_blocked:branch_divergence"
+        );
+        assert!(output_json["stderr"]
+            .as_str()
+            .expect("stderr")
+            .contains("branch divergence detected before workspace tests"));
+        assert!(output_json.get("structuredContent").is_none());
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
         let _ = std::fs::remove_dir_all(root);
@@ -8449,11 +9233,15 @@ printf 'pwsh:%s' "$1"
         let output: serde_json::Value = serde_json::from_str(&result).expect("json");
         assert_eq!(output["stdout"], "pwsh:Write-Output hello");
         assert!(output["stderr"].as_str().expect("stderr").is_empty());
+        assert!(output.get("rawOutputPath").is_none());
+        assert!(output.get("noOutputExpected").is_none());
 
         let background_output: serde_json::Value = serde_json::from_str(&background).expect("json");
         assert!(background_output["backgroundTaskId"].as_str().is_some());
-        assert_eq!(background_output["backgroundedByUser"], true);
-        assert_eq!(background_output["assistantAutoBackgrounded"], false);
+        assert!(background_output.get("rawOutputPath").is_none());
+        assert!(background_output.get("noOutputExpected").is_none());
+        assert!(background_output["backgroundedByUser"].is_null());
+        assert!(background_output["assistantAutoBackgrounded"].is_null());
     }
 
     #[test]

@@ -13,6 +13,7 @@ use crate::permissions::{
     PermissionContext, PermissionOutcome, PermissionPolicy, PermissionPrompter,
 };
 use crate::session::{ContentBlock, ConversationMessage, Session};
+use crate::tool_session::with_tool_session_context;
 use crate::usage::{TokenUsage, UsageTracker};
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
@@ -313,7 +314,11 @@ where
                 system_prompt: self.system_prompt.clone(),
                 messages: self.session.messages.clone(),
             };
-            let events = match self.api_client.stream(request) {
+            let events = match with_tool_session_context(
+                &self.session.session_id,
+                self.session.persistence_path(),
+                || self.api_client.stream(request),
+            ) {
                 Ok(events) => events,
                 Err(error) => {
                     self.record_turn_failed(iterations, &error);
@@ -407,11 +412,14 @@ where
                 let result_message = match permission_outcome {
                     PermissionOutcome::Allow => {
                         self.record_tool_started(iterations, &tool_name);
-                        let (mut output, mut is_error) =
-                            match self.tool_executor.execute(&tool_name, &effective_input) {
+                        let (mut output, mut is_error) = with_tool_session_context(
+                            &self.session.session_id,
+                            self.session.persistence_path(),
+                            || match self.tool_executor.execute(&tool_name, &effective_input) {
                                 Ok(output) => (output, false),
                                 Err(error) => (error.to_string(), true),
-                            };
+                            },
+                        );
                         output = merge_hook_feedback(pre_hook_result.messages(), output, false);
 
                         let post_hook_result = if is_error {
