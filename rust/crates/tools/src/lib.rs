@@ -7575,7 +7575,6 @@ mod tests {
     #[test]
     fn worker_create_merges_config_trusted_roots_without_per_call_override() {
         let _guard = env_guard();
-        use std::fs;
         // Write a .claw/settings.json in a temp dir with trustedRoots
         let worktree = temp_path("config-trust-worktree");
         let claw_dir = worktree.join(".claw");
@@ -7754,7 +7753,6 @@ mod tests {
         let _guard = env_guard();
         // End-to-end proof: .claw/worker-state.json reflects every transition
         // through the stall-detect -> resolve-trust -> ready loop.
-        use std::fs;
 
         // Use a real temp CWD so state file can be written
         let worktree = temp_path("recovery-loop-state");
@@ -9004,6 +9002,7 @@ mod tests {
         fs::create_dir_all(&root).expect("root dir should exist");
         let original_dir = std::env::current_dir().expect("cwd");
         std::env::set_current_dir(&root).expect("set cwd");
+        let active_cwd = std::env::current_dir().expect("active cwd");
 
         let result = execute_tool(
             "Skill",
@@ -9017,7 +9016,7 @@ mod tests {
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
         assert_eq!(output["path"], "bundled://verify");
         let prompt = output["prompt"].as_str().expect("prompt");
-        let expected_root = tool_output_root(&root).join("skills").join("verify");
+        let expected_root = tool_output_root(&active_cwd).join("skills").join("verify");
         let expected_root_text = expected_root.display().to_string();
         assert!(prompt.contains(&format!(
             "Base directory for this skill: {expected_root_text}"

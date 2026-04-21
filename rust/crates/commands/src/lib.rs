@@ -2887,7 +2887,9 @@ pub fn activate_conditional_skills_for_paths(
 }
 
 fn normalize_relative_match_path(path: &Path, cwd: &Path) -> Option<String> {
-    let relative = path.strip_prefix(cwd).ok()?;
+    let normalized_path = normalize_conditional_skill_match_path(path);
+    let normalized_cwd = normalize_conditional_skill_match_path(cwd);
+    let relative = normalized_path.strip_prefix(&normalized_cwd).ok()?;
     let relative = relative.to_string_lossy().replace('\\', "/");
     let relative = relative.trim_start_matches("./").trim_matches('/');
     if relative.is_empty() || relative.starts_with("..") {
@@ -2895,6 +2897,36 @@ fn normalize_relative_match_path(path: &Path, cwd: &Path) -> Option<String> {
     } else {
         Some(relative.to_string())
     }
+}
+
+fn normalize_conditional_skill_match_path(path: &Path) -> PathBuf {
+    if let Ok(canonical) = path.canonicalize() {
+        return clean_conditional_skill_match_path(canonical);
+    }
+
+    if let Some(parent) = path.parent() {
+        let canonical_parent = parent.canonicalize().map_or_else(
+            |_| clean_conditional_skill_match_path(parent.to_path_buf()),
+            clean_conditional_skill_match_path,
+        );
+        if let Some(name) = path.file_name() {
+            return clean_conditional_skill_match_path(canonical_parent.join(name));
+        }
+    }
+
+    clean_conditional_skill_match_path(path.to_path_buf())
+}
+
+fn clean_conditional_skill_match_path(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let text = path.to_string_lossy();
+        if let Some(stripped) = text.strip_prefix(r"\\?\") {
+            return PathBuf::from(stripped);
+        }
+    }
+
+    path
 }
 
 fn skill_paths_match(patterns: &[String], relative_path: &str) -> bool {
@@ -4402,10 +4434,10 @@ mod tests {
         handle_agents_slash_command_json, handle_plugins_slash_command,
         handle_skills_slash_command_json, handle_slash_command,
         handle_slash_command_with_compactor, load_agents_from_roots, load_skills_from_roots,
-        load_skills_from_roots_for_context, render_agents_report, render_agents_report_json,
-        render_mcp_report_json_for, render_plugins_report, render_skills_report,
-        render_slash_command_help, render_slash_command_help_detail, resolve_skill,
-        resolve_skill_path, resume_supported_slash_commands, slash_command_specs,
+        load_skills_from_roots_for_context, normalize_relative_match_path, render_agents_report,
+        render_agents_report_json, render_mcp_report_json_for, render_plugins_report,
+        render_skills_report, render_slash_command_help, render_slash_command_help_detail,
+        resolve_skill, resolve_skill_path, resume_supported_slash_commands, slash_command_specs,
         suggest_slash_commands, validate_slash_command_input, DefinitionSource, SkillOrigin,
         SkillRoot, SkillSlashDispatch, SlashCommand,
     };
@@ -4991,6 +5023,25 @@ mod tests {
         assert_eq!(
             resolve_skill_path(&workspace, "rustacean").expect("conditional skill should resolve"),
             conditional_root.join("SKILL.md")
+        );
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn conditional_skill_matching_normalizes_noncanonical_workspace_roots() {
+        let workspace = temp_dir("conditional-skills-noncanonical");
+        let source_dir = workspace.join("src");
+        let source_file = source_dir.join("lib.rs");
+        fs::create_dir_all(&source_dir).expect("create source dir");
+        fs::write(&source_file, "fn helper() {}\n").expect("write source file");
+
+        let canonical_file = source_file.canonicalize().expect("canonical source file");
+        let aliased_workspace = workspace.join("src").join("..");
+
+        assert_eq!(
+            normalize_relative_match_path(&canonical_file, &aliased_workspace),
+            Some("src/lib.rs".to_string())
         );
 
         let _ = fs::remove_dir_all(workspace);
