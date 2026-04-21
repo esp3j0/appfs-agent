@@ -7574,6 +7574,7 @@ mod tests {
 
     #[test]
     fn worker_create_merges_config_trusted_roots_without_per_call_override() {
+        let _guard = env_guard();
         use std::fs;
         // Write a .claw/settings.json in a temp dir with trustedRoots
         let worktree = temp_path("config-trust-worktree");
@@ -7750,6 +7751,7 @@ mod tests {
 
     #[test]
     fn recovery_loop_state_file_reflects_transitions() {
+        let _guard = env_guard();
         // End-to-end proof: .claw/worker-state.json reflects every transition
         // through the stall-detect -> resolve-trust -> ready loop.
         use std::fs;
