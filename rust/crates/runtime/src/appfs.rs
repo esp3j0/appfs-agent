@@ -1228,7 +1228,8 @@ mod tests {
 
         assert!(prompt.contains("AppFS mounts bridge-backed software into a filesystem"));
         assert!(prompt.contains("Do not guess act schemas or payload shapes"));
-        assert!(prompt.contains("Mounted app skills are listed separately in the skill listing attachment"));
+        assert!(prompt
+            .contains("Mounted app skills are listed separately in the skill listing attachment"));
         assert!(prompt.contains("Never use `write_file` or `edit_file` on `*.act` files"));
         assert!(prompt.contains("chat-long"));
         assert!(prompt.contains("_stream/events.evt.jsonl"));
@@ -1248,7 +1249,8 @@ mod tests {
 
         let prompt = build_appfs_prompt_section(&cwd).expect("expected appfs prompt section");
 
-        assert!(prompt.contains("Mounted app skills are listed separately in the skill listing attachment"));
+        assert!(prompt
+            .contains("Mounted app skills are listed separately in the skill listing attachment"));
         assert!(prompt.contains("Scheduler app for room bookings and meeting setup."));
         assert!(prompt.contains("meeting-room-b"));
         assert!(prompt.contains("Never use `write_file` or `edit_file` on `*.act` files"));
@@ -1265,10 +1267,15 @@ mod tests {
         seed_heuristic_mount(&mount_root);
         seed_aiim_prompt_files(&app_root);
 
-        let prompt = build_appfs_prompt_section(&mount_root).expect("expected appfs prompt section");
+        let prompt =
+            build_appfs_prompt_section(&mount_root).expect("expected appfs prompt section");
 
-        assert!(prompt.contains("You are inside an AppFS mount, but not currently inside a specific app root."));
-        assert!(prompt.contains("Mounted apps currently detected under this root: `aiim`, `notion`."));
+        assert!(prompt.contains(
+            "You are inside an AppFS mount, but not currently inside a specific app root."
+        ));
+        assert!(
+            prompt.contains("Mounted apps currently detected under this root: `aiim`, `notion`.")
+        );
         assert!(prompt.contains("Use the skill listing to load the matching `appfs-<app>` skill"));
         assert!(!prompt.contains("## Mounted apps"));
         assert!(!prompt.contains("`aiim` -> skill `appfs-aiim`"));

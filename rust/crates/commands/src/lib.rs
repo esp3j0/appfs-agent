@@ -3363,8 +3363,7 @@ fn discover_app_roots_under_mount(mount_root: &Path) -> Vec<PathBuf> {
             if matches!(name.as_str(), "_appfs" | ".well-known") {
                 return None;
             }
-            let looks_like_app =
-                path.join("_app").is_dir() || path.join("_stream").is_dir();
+            let looks_like_app = path.join("_app").is_dir() || path.join("_stream").is_dir();
             looks_like_app.then_some(path)
         })
         .collect()
