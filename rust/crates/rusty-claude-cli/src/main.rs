@@ -59,8 +59,8 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use tools::{
     execute_tool, execute_tool_with_effects, model_visible_tool_result, mvp_tool_specs,
-    should_inject_model_facing_skill_listing, sync_model_facing_skill_listing,
-    GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput,
+    should_inject_model_facing_skill_listing, sync_model_facing_skill_listing, GlobalToolRegistry,
+    RuntimeToolDefinition, ToolSearchOutput,
 };
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
@@ -220,8 +220,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 // prompter may invoke CliPermissionPrompter::decide(), stdin
                 // must remain available for interactive approval; otherwise the
                 // prompter's read_line() would hit EOF and deny every request.
-                let stdin_context = if matches!(permission_mode, PermissionMode::DangerFullAccess)
-                {
+                let stdin_context = if matches!(permission_mode, PermissionMode::DangerFullAccess) {
                     read_piped_stdin()
                 } else {
                     None
